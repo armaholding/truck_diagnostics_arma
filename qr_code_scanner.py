@@ -1,11 +1,10 @@
 import cv2
-from pyzbar import pyzbar
 import os
-import numpy as np
 
 # Configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 NAMES_FILE = os.path.join(BASE_DIR, 'names.txt')
+QRCODE_PREFIX = "arma_driver: "
 
 def is_name_in_database(name_to_check):
     """Check if name exists in names.txt (case-insensitive). Return original name if found."""
@@ -25,6 +24,13 @@ def is_name_in_database(name_to_check):
         return None
     return None
 
+def extract_name_from_scanned(scanned_value: str) -> str:
+    """
+    Extract the actual name from a scanned QR code value.
+    Assumes the value starts with QRCODE_PREFIX.
+    """
+    return scanned_value[len(QRCODE_PREFIX):]
+    
 def scan_one_qr():
     """Scan exactly one QR code and return its content, or None if canceled."""
     print("📸 Opening camera... Show a QR code.")
@@ -34,6 +40,8 @@ def scan_one_qr():
         print("❌ Could not access camera.")
         return None
 
+    qr_decoder = cv2.QRCodeDetector()
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -42,25 +50,20 @@ def scan_one_qr():
         cv2.imshow("QR Scanner - Show QR Code (Press 'q' to cancel)", frame)
 
         # Decode QR
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        decoded_objects = pyzbar.decode(gray)
+        decoded_info, points, _ = qr_decoder.detectAndDecode(frame)
 
-        if decoded_objects:
-            obj = decoded_objects[0]
-            scanned_value = obj.data.decode('utf-8').strip()
-            
-            # Briefly highlight detection
-            pts = [(point.x, point.y) for point in obj.polygon]
-            if len(pts) == 4:
-                cv2.polylines(frame, [np.array(pts, np.int32)], True, (0, 255, 0), 3)
+        if decoded_info:
+            # Draw bounding box
+            if points is not None:
+                pts = points[0].astype(int)
+                cv2.polylines(frame, [pts], True, (0, 255, 0), 3)
                 cv2.imshow("QR Scanner - Show QR Code (Press 'q' to cancel)", frame)
-                cv2.waitKey(300)  # Show green box for 0.3 sec
+                cv2.waitKey(300)
 
             cap.release()
             cv2.destroyAllWindows()
-            return scanned_value
+            return decoded_info.strip()
 
-        # Allow manual cancel
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
@@ -69,7 +72,12 @@ def scan_one_qr():
     return None
 
 def main():
+    """
+    Run the QR scanner interactively and collect all matched names.
+    Returns a list of successfully validated names (original casing).
+    """
     print("👋 Welcome to the QR Code Scanner!")
+    matched_names = []
     
     while True:
         user_input = input("\n🔍 Do you want to scan a QR code? (y/n): ").strip().lower()
@@ -82,13 +90,23 @@ def main():
             if scanned is None:
                 print("⚠️  Scan canceled or failed.")
             else:
-                matched_name = is_name_in_database(scanned)
-                if matched_name is not None:
-                    print(f"✅ {matched_name} is in the database")
-                else:
-                    print(f"❌ '{scanned}' is NOT in the database")
+                try:
+                    # Extract name by removing prefix if present
+                    name_to_check = extract_name_from_scanned(scanned)
+                    matched_name = is_name_in_database(name_to_check)
+                    if matched_name is not None:
+                        print(f"✅ {matched_name} is in the database")
+                        matched_names.append(matched_name)
+                    else:
+                        print(f"❌ '{scanned}' is NOT in the database (checked as: '{name_to_check}')")
+                except IndexError:
+                    # Handles case where scanned_value is shorter than prefix
+                    print(f"❌ Invalid QR format: missing prefix '{QRCODE_PREFIX}'")
         else:
             print("⚠️  Please enter 'y' for yes or 'n' for no.")
 
+    return matched_names
+
 if __name__ == "__main__":
-    main()
+    match_name_list = main()
+    print(match_name_list)
