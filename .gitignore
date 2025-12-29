@@ -1,0 +1,11 @@
+# Environment variables
+.env
+
+# Folders (ignore everything inside)
+qr_codes/
+trash_images_storage/
+
+# specific files
+generated_qr_names.json
+trash_detection.json
+yolo_truck.py
