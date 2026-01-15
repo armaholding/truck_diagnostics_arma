@@ -1,11 +1,22 @@
 # Environment variables
 .env
+__pycache__/
+*.pyc
 
 # Folders (ignore everything inside)
 qr_codes/
 trash_images_storage/
+video_storage/
+cropped_parts/
+diagnostics/
+image_storage/
+
+# Model training outputs
+runs/
+
+# Roboflow dataset downloads
+truck_parts-*/
 
 # specific files
 generated_qr_names.json
 trash_detection.json
-yolo_truck.py
