@@ -8,11 +8,17 @@ import cv2
 #     else:
 #         print(f"❌ No camera at index {i}")
 
+import numpy as np
 
-import cv2
+# Test if GUI functions work
+img = np.zeros((300, 300, 3), dtype=np.uint8)
+cv2.imshow("Test Window", img)
+print("If you see a black window, GUI works!")
+cv2.waitKey(2000)  # Wait 2 sec
+cv2.destroyAllWindows()
 
-# Try different indices (0, 1, 2, etc.) if the default doesn't work
-cap = cv2.VideoCapture(0) 
+# Test camera access
+cap = cv2.VideoCapture(0) # Try different indices (0, 1, 2, etc.) if the default doesn't work
 
 if not cap.isOpened():
     print("Error: Could not open camera.")
