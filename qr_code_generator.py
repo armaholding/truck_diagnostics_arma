@@ -47,8 +47,53 @@ def save_generated_names(names_set: set) -> None:
     except Exception as e:
         logging.error(f"Failed to save {GENERATED_NAMES_JSON}: {e}")
 
-def generate_qr_codes():
-    """Generate QR codes for names in names.txt, skipping already processed entries."""
+def generate_qr_code(name: str, font) -> str:
+    """
+    Generate and save a QR code image for a single name.
+    Returns the saved filename (without path).
+    """
+    # Encode payload: 'arma_driver: <name>' → Base64
+    qr_data_raw = QRCODE_PREFIX + name
+    qr_data = base64.b64encode(qr_data_raw.encode('utf-8')).decode('ascii')
+
+    # Create QR code instance
+    qr = qrcode.QRCode(
+        version=QR_VERSION,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=BOX_SIZE,
+        border=BORDER,
+    )
+    qr.add_data(qr_data)
+    qr.make(fit=True)
+
+    # Render QR image
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
+    qr_width, qr_height = qr_img.size
+
+    # Create composite image with name label below QR
+    text_height = FONT_SIZE + 10
+    total_height = qr_height + text_height
+    final_img = Image.new('RGB', (qr_width, total_height), 'white')
+    final_img.paste(qr_img, (0, 0))
+
+    # Center-align name text
+    draw = ImageDraw.Draw(final_img)
+    text_bbox = draw.textbbox((0, 0), name, font=font)
+    text_width = text_bbox[2] - text_bbox[0]
+    x = (qr_width - text_width) // 2
+    y = qr_height + 5
+    draw.text((x, y), name, fill="black", font=font)
+
+    # Generate safe filename and save
+    safe_name = "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in name)
+    filename = f"{safe_name.replace(' ', '_')}.png"
+    output_path = os.path.join(QR_CODE_PATH, filename)
+    final_img.save(output_path)
+
+    return filename
+    
+def main():
+    """Main entry point: orchestrate QR code batch generation."""
     os.makedirs(QR_CODE_PATH, exist_ok=True)
     generated_names = load_generated_names()
 
@@ -79,56 +124,17 @@ def generate_qr_codes():
             continue
 
         try:
-            qr = qrcode.QRCode(
-                version=QR_VERSION,
-                error_correction=qrcode.constants.ERROR_CORRECT_L,
-                box_size=BOX_SIZE,
-                border=BORDER,
-            )
-            # Encode payload: 'arma_driver: <name>' → Base64
-            qr_data_raw = QRCODE_PREFIX + name
-            qr_data = base64.b64encode(qr_data_raw.encode('utf-8')).decode('ascii')
-            qr.add_data(qr_data)
-            qr.make(fit=True)
-
-            # Render QR image
-            qr_img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
-            qr_width, qr_height = qr_img.size
-
-            # Create composite image with name label
-            text_height = FONT_SIZE + 10
-            total_height = qr_height + text_height
-            final_img = Image.new('RGB', (qr_width, total_height), 'white')
-            final_img.paste(qr_img, (0, 0))
-
-            # Center-align name below QR code
-            draw = ImageDraw.Draw(final_img)
-            text_bbox = draw.textbbox((0, 0), name, font=font)
-            text_width = text_bbox[2] - text_bbox[0]
-            x = (qr_width - text_width) // 2
-            y = qr_height + 5
-            draw.text((x, y), name, fill="black", font=font)
-
-            # Generate safe filename and save
-            safe_name = "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in name)
-            filename = f"{safe_name.replace(' ', '_')}.png"
-            output_path = os.path.join(QR_CODE_PATH, filename)
-            final_img.save(output_path)
-
+            filename = generate_qr_code(name, font)
             logging.info(f"Saved: {filename} (label: '{name}')")
 
-            # Record success to avoid reprocessing
+            # Record success to avoid reprocessing (crash-safe)
             generated_names.add(name)
             save_generated_names(generated_names)
 
         except qrcode.exceptions.DataOverflowError:
             logging.error(f"Name too long for QR version {QR_VERSION}: '{name}'. Increase version.")
 
-def main():
-    """Main entry point."""
-    print(f"🚀 Generating QR codes from {TEXT_PATH} (skipping names where qr codes have been generated)...")
-    generate_qr_codes()
-    print("✅ Done!")
-
 if __name__ == "__main__":
+    print(f"🚀 Generating QR codes from {TEXT_PATH} (skipping names where qr codes have been generated)...")
     main()
+    print("✅ Done!")
