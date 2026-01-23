@@ -221,28 +221,24 @@ def process_diagnostics_and_save(
         source_info: Dict with source information (image name or frame details)
         
     Returns:
-        tuple: (diagnostics_log, extracted_plate_number, enhanced_components)
+        tuple: (diagnostics_log, enhanced_components)
     """
     # Run diagnostics based on truck face
     diagnostics_log = []
-    extracted_plate_number = None
 
     if truck_face == "truck_back":
         logger.info("Running back diagnostics")
         diag_messages, plate_num = run_back_diagnostics(components, plate_crop, reader)
         diagnostics_log = diag_messages
-        extracted_plate_number = plate_num
     elif truck_face == "truck_front":
         logger.info("Running front diagnostics")
         diag_messages, plate_num = run_front_diagnostics(components, plate_crop, reader)
         diagnostics_log = diag_messages
-        extracted_plate_number = plate_num
     else:
         msg = "truck face not detected — no diagnostics performed"
         print(msg)
         logger.warning(msg)
         diagnostics_log = [msg]
-        extracted_plate_number = None
 
     # Print diagnostics to console
     for msg in diagnostics_log:
@@ -262,8 +258,8 @@ def process_diagnostics_and_save(
             "count": len(raw_data['confidences']),
             "confidence": raw_data['confidences']
         }
-        if comp == 'plate_number' and extracted_plate_number is not None:
-            comp_entry["number"] = extracted_plate_number
+        if comp == 'plate_number' and plate_num is not None:
+            comp_entry["number"] = plate_num
         enhanced_components[comp] = comp_entry
 
     # Save diagnostics to JSON file
@@ -283,16 +279,11 @@ def process_diagnostics_and_save(
         json.dump(diagnostic_results, f, indent=2, ensure_ascii=False)
     logger.info(f"Enhanced diagnostic results saved to: {diag_output_path}")
 
-    return diagnostics_log, extracted_plate_number, enhanced_components
+    return diagnostics_log, enhanced_components
 
 # --- Main Execution Function ---
 def main():
     logger.info("Starting truck diagnostic pipeline")
-
-    # # Save to temporary file
-    # with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
-    #     temp_file.write(processed_image_bytes.getvalue())
-    #     temp_file_path = temp_file.name
 
     result = None  # Store the return value
 
@@ -319,7 +310,7 @@ def main():
 
         # Process diagnostics and save results
         source_info = {"image_name": os.path.basename(IMAGE_PATH)}
-        diagnostics_log, extracted_plate_number, enhanced_components = process_diagnostics_and_save(
+        diagnostics_log, enhanced_components = process_diagnostics_and_save(
             detected_json["truck_face"],
             detected_json["truck_components"],
             full_component_data,
@@ -338,12 +329,16 @@ def main():
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
+        # Split diagnostics into OK and NG
+        diagnostics_ok = [m for m in diagnostics_log if m.startswith("✅")]
+        diagnostics_ng = [m for m in diagnostics_log if m.startswith(("❌", "⚠️"))]
+
         # Store result for return after cleanup
         result = {
             "truck_face": detected_json["truck_face"],
             "truck_components": enhanced_components,
-            "extracted_plate_number": extracted_plate_number,
-            "diagnostics": diagnostics_log
+            "diagnostics_ok": diagnostics_ok,
+            "diagnostics_ng": diagnostics_ng
         }
         
     except Exception as e:
@@ -363,5 +358,20 @@ def main():
 
 # --- Entry Point ---
 if __name__ == "__main__":
-    diagnostics = main()
-    print(f"This is the truck diagnosis: {diagnostics}")
+    results = main()
+    if results is None:
+        print("❌ Truck inspection failed: no results generated.")
+    else:
+        truck_face = results["truck_face"]
+        truck_components = results["truck_components"]
+        diagnostics_ok = results["diagnostics_ok"]
+        diagnostics_ng = results["diagnostics_ng"]
+        plate_number = truck_components.get("plate_number", {}).get("number", "N/A")
+        print(f"This is the summary of the truck diagnosis:\n{truck_face} \n{truck_components} \n{plate_number} \n{diagnostics_ok} \n{diagnostics_ng}")
+
+        if not diagnostics_ng:
+            print("✅ Truck passed inspection!")
+        else:
+            print(f"❌ Issues found: {len(diagnostics_ng)}")
+            for issue in diagnostics_ng:
+                print("  ", issue)
