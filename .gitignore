@@ -20,3 +20,4 @@ truck_parts-*/
 # specific files
 generated_qr_names.json
 trash_detection.json
+output_video.mp4
