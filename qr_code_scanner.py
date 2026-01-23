@@ -88,7 +88,6 @@ def scan_one_qr():
 
 def main():
     """Interactive QR scanner: validate scanned codes against local name database."""
-    print("👋 Welcome to the QR Code Scanner!")
     matched_names = []
     
     while True:
@@ -118,5 +117,6 @@ def main():
     return matched_names
 
 if __name__ == "__main__":
+    print("👋 Welcome to the QR Code Scanner!")
     match_name_list = main()
     print("\n✅ Matched names:", match_name_list)
