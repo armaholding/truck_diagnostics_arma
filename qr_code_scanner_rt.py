@@ -5,6 +5,8 @@ import logging
 import time
 from collections import Counter
 import re
+from datetime import datetime
+import sys
 
 # Configure logging (console output with level prefix)
 logging.basicConfig(
@@ -258,54 +260,99 @@ def scan_one_qr():
     return None
 
 def main():
-    """Interactive QR scanner: validate scanned codes against local name database."""
+    """Main function to run QR code scanning based on INPUT_MODE."""
     matched_names = []
 
-    # Determine input mode from constant
+    # Pre-flight validation with timestamp on failure paths
     input_mode = INPUT_MODE.strip().lower()
     if input_mode not in ("camera", "video", "image"):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logging.error(f"Invalid INPUT_MODE: {INPUT_MODE}. Must be 'camera', 'video', or 'image'.")
-        return matched_names
+        return timestamp, None
 
-    while True:
-        user_input = input("\n🔍 Do you want to scan a QR code? (y/n): ").strip().lower()
+    # File existence checks with timestamp on failure
+    if input_mode == 'video':
+        if not os.path.exists(VIDEO_FILE_PATH):
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logging.error(f"Video file not found: {VIDEO_FILE_PATH}")
+            return timestamp, None
+    
+    if input_mode == 'image':
+        if not os.path.exists(IMAGE_FILE_PATH):
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logging.error(f"Image file not found: {IMAGE_FILE_PATH}")
+            return timestamp, None
 
-        if user_input in ('n', 'no'):
-            print("👋 Goodbye!")
-            break
-        elif user_input in ('y', 'yes'):
-            scanned = None
+    # ✅ RECORD TIMESTAMP HERE: Start of actual scan operation
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            if input_mode == 'camera':
-                scanned = scan_from_camera()
-            elif input_mode == 'video':
-                print("🎬 Processing video file...")
-                scanned = scan_from_video_file()
-            elif input_mode == 'image':
-                print("🖼️  Processing image file...")
-                scanned = scan_from_image_file()
+    # Unified single-scan execution (no loops/prompts)
+    scanned = None
 
-            if scanned is None:
-                print("⚠️  Scan canceled or failed.")
-            else:
-                print(f"🔍 RAW SCANNED VALUE: [{repr(scanned)}]")
-                print(f"    Length: {len(scanned)}")
-                try:
-                    name_to_check = extract_name_from_scanned(scanned)
-                    matched_name = is_name_in_database(name_to_check)
-                    if matched_name is not None:
-                        print(f"✅ {matched_name} is in the database")
-                        matched_names.append(matched_name)
-                    else:
-                        print(f"❌ Scanned name not in database: '{name_to_check}'")
-                except IndexError as e:
-                    print(f"❌ Invalid QR format: {e}")
+    try:
+        if input_mode == 'camera':
+            print("📸 Opening camera... Hold QR code steady for 3 seconds.")
+            scanned = scan_from_camera()
+
+        elif input_mode == 'video':
+            print("🎬 Processing video file (first 3 seconds)...")
+            if not os.path.exists(VIDEO_FILE_PATH):
+                logging.error(f"Video file not found: {VIDEO_FILE_PATH}")
+                return None
+            scanned = scan_from_video_file()
+
+        elif input_mode == 'image':
+            print("🖼️  Processing image file...")
+            if not os.path.exists(IMAGE_FILE_PATH):
+                logging.error(f"Image file not found: {IMAGE_FILE_PATH}")
+                return None
+            scanned = scan_from_image_file()
+
+    except Exception as e:
+        logging.error(f"Scan execution failed: {e}")
+        return timestamp, None
+
+    # Determine scan outcome
+    if scanned is None:
+        # Distinguish cancellation from detection failure (for UX only)
+        if input_mode == 'camera':
+            print("⚠️  Scan canceled by user")
         else:
-            print("⚠️  Please enter 'y' for yes or 'n' for no.")
+            print("⚠️  Scan failed: No QR code detected")
+        return timestamp, None
 
-    return matched_names
+    # QR successfully detected and decoded → process immediately
+    print(f"🔍 RAW SCANNED VALUE: [{repr(scanned)}]")
+    print(f"    Length: {len(scanned)}")
+          
+    try:
+        name_to_check = extract_name_from_scanned(scanned)
+        matched_name = is_name_in_database(name_to_check)
+        if matched_name is not None:
+            print(f"✅ {matched_name} is in the database")
+            matched_names.append(matched_name)
+        else:
+            print(f"❌ Scanned name not in database: '{name_to_check}'")
+    except IndexError as e:
+        print(f"❌ Invalid QR format: {e}")
+        return timestamp, None
+    
+    return timestamp, matched_names
+
 
 if __name__ == "__main__":
     print("👋 Welcome to the QR Code Scanner!")
-    match_name_list = main()
-    print(f"\n✅ {BLUE}Matched driver's names: {RESET}{match_name_list}")
+    qr_scan_timestamp, match_name_list = main()
+
+    # Display timestamp prominently
+    print(f"\n⏱️  {BLUE}Scan performed at: {qr_scan_timestamp}{RESET}")
+    
+    # Final output (always shown, even if empty)
+    print(f"✅ {BLUE}Matched driver's names: {match_name_list}{RESET}")
+    if match_name_list is None:
+        print(f"⚠️ {RED}Scan failed or canceled{RESET}")
+    elif not match_name_list:
+        print("ℹ️  No valid driver found in scan")
+    
+    # Exit code for standalone CLI usage (does not affect orchestrator)
+    sys.exit(0 if match_name_list is not None else 1)
