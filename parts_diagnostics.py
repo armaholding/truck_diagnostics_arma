@@ -5,11 +5,11 @@ from config import DIAGNOSTIC_THRESHOLD, EXPECTED_COMPONENT_COUNTS
 
 # --- OCR Helper Functions ---
 def run_ocr_on_plate(plate_image, reader):
-    """Run EasyOCR and return cleaned alphanumeric plate text, or None."""
+    """Run EasyOCR and return tuple (cleaned alphanumeric plate text, confidence score), or (None, 0.0) on failure."""
     try:
         results = reader.readtext(plate_image)
         if not results:
-            return None
+            return None, 0.0
         
         # Get the text with highest confidence
         best_text = None
@@ -24,11 +24,11 @@ def run_ocr_on_plate(plate_image, reader):
             cleaned = ''.join(ch for ch in best_text if ch.isalnum() or ch.isspace())
             cleaned = cleaned.strip().upper()
             if cleaned:
-                return cleaned
-        return None
+                return cleaned, best_conf 
+        return None, 0.0
     except Exception as e:
         # Optionally log, but for now just suppress
-        return None
+        return None, 0.0
 
 # --- Modular Component Diagnostic Functions ---
 def check_mirrors(comp_data):
@@ -81,16 +81,16 @@ def check_lift(comp_data):
 
 def check_plate_number(comp_data, plate_image=None, reader=None):
     if comp_data["count"] < EXPECTED_COMPONENT_COUNTS['plate_number'] or not all(c >= DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
-        return "❌ plate number: missing or obscured", None
+        return "❌ plate number: missing or obscured", None, 0.0
 
     if plate_image is not None and reader is not None:
-        extracted = run_ocr_on_plate(plate_image, reader)
+        extracted, ocr_conf = run_ocr_on_plate(plate_image, reader)
         if extracted:
-            return f"✅ plate number: visible, with number: {extracted}", extracted
+            return f"✅ plate number: visible, with number: {extracted}", extracted, ocr_conf
         else:
-            return "⚠️ plate number: visible but could not be read", None
+            return "⚠️ plate number: visible but could not be read", None, ocr_conf
     else:
-        return "⚠️ plate number: visible but could not be read", None
+        return "⚠️ plate number: visible but could not be read", None, 0.0
 
 # --- Diagnostic Orchestrators ---
 def run_front_diagnostics(components, plate_crop=None, reader=None):
@@ -100,10 +100,10 @@ def run_front_diagnostics(components, plate_crop=None, reader=None):
     diagnostics.append(check_front_lights(components.get('light_front', {"count": 0, "confidence": []})))
     diagnostics.append(check_wipers(components.get('wiper', {"count": 0, "confidence": []})))
     diagnostics.append(check_mirror_top(components.get('mirror_top', {"count": 0, "confidence": []})))
-    plate_msg, plate_number = check_plate_number(components.get('plate_number', {"count": 0, "confidence": []}), plate_crop, reader)
+    plate_msg, plate_number, ocr_conf = check_plate_number(components.get('plate_number', {"count": 0, "confidence": []}), plate_crop, reader)
     diagnostics.append(plate_msg)
     
-    return diagnostics, plate_number
+    return diagnostics, plate_number, ocr_conf
 
 def run_back_diagnostics(components, plate_crop=None, reader=None):
     diagnostics = []
@@ -112,7 +112,7 @@ def run_back_diagnostics(components, plate_crop=None, reader=None):
     diagnostics.append(check_stands(components.get('stand', {"count": 0, "confidence": []})))
     diagnostics.append(check_carrier(components.get('carrier', {"count": 0, "confidence": []})))
     diagnostics.append(check_lift(components.get('lift', {"count": 0, "confidence": []})))
-    plate_msg, plate_number = check_plate_number(components.get('plate_number', {"count": 0, "confidence": []}), plate_crop, reader)
+    plate_msg, plate_number, ocr_conf = check_plate_number(components.get('plate_number', {"count": 0, "confidence": []}), plate_crop, reader)
     diagnostics.append(plate_msg)
     
-    return diagnostics, plate_number
+    return diagnostics, plate_number, ocr_conf
