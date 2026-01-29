@@ -1,15 +1,14 @@
 import cv2
 from ultralytics import YOLO
-# from PIL import Image
-# import io
-# import tempfile
 import os
 import json
 import easyocr
 import logging
-import datetime
+from datetime import datetime
 import torch
-from config import OCR_LANGUAGES, DIAGNOSTIC_THRESHOLD, EXPECTED_COMPONENT_COUNTS, FRONT_EXPECTED_COMPONENTS, BACK_EXPECTED_COMPONENTS
+import re
+from config import OCR_LANGUAGES, EXPECTED_COMPONENT_COUNTS, FRONT_EXPECTED_COMPONENTS, BACK_EXPECTED_COMPONENTS
+from diagnostic_history import DiagnosticHistory
 from parts_diagnostics import run_front_diagnostics, run_back_diagnostics
 
 # --- Logging Configuration ---
@@ -27,15 +26,18 @@ OUTPUT_IMAGE_PATH = "annotated_image.jpg"
 VIDEO_FILE_PATH = os.path.join(BASE_DIR, 'truck_test', 'test_video.mp4') # Default test video
 VIDEO_OUTPUT_PATH = "output_video.mp4"
 DIAGNOSTICS_PATH = "diagnostics"
+SAVE_INTERMEDIATE_DIAGNOSTICS = True  # Set to True to save diagnostics for each frame in video mode
 SAVE_CROPS = True  # Set to True to save cropped bounding boxes for validation
 CROPPED_PARTS_PATH = "cropped_parts"
+YOLO_CONFIDENCE_WEIGHT = 0.60  # Weight for YOLO detection confidence in plate consensus
+OCR_CONFIDENCE_WEIGHT = 0.40   # Weight for OCR readability confidence in plate consensus
 
 # --- Input & Tracking Configuration ---
 INPUT_MODE = "video"  # Options: "image", "camera", "video"
 CAMERA_INDEX = 0
-CONSENSUS_WINDOW_SECONDS = 20
-IGNORE_PERIOD_SECONDS = 2
-SAVE_INTERVAL_SECONDS = 2
+CONSENSUS_WINDOW_SECONDS = 18
+IGNORE_PERIOD_SECONDS = 1
+SAVE_INTERVAL_SECONDS = 2.5
 TRACKER_TYPE = "botsort.yaml"  # or "bytetrack.yaml"
 
 BLUE = "\033[94m"
@@ -50,7 +52,12 @@ reader = easyocr.Reader(OCR_LANGUAGES, verbose=False)
 
 # --- GPU/CPU Detection ---
 def get_device():
-    """Automatically select GPU if available, otherwise CPU."""
+    """
+    Automatically select GPU if available, otherwise fall back to CPU.
+    
+    Returns:
+        str: Device identifier ('cuda' if GPU available, 'cpu' otherwise)
+    """
     if torch.cuda.is_available():
         device = 'cuda'
         logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
@@ -59,28 +66,134 @@ def get_device():
         logger.info("Using CPU (no GPU detected)")
     return device
 
+# --- YOLO Model Caching Function ---
+_yolo_model = None
+_yolo_device = None
+
+def get_cached_yolo_model():
+    """
+    Get cached YOLO model instance to avoid reloading between frames.
+    
+    Returns:
+        tuple: (model, device)
+            - model: Cached YOLO model instance
+            - device: Device where model is loaded ('cuda' or 'cpu')
+    """
+    global _yolo_model, _yolo_device
+    if _yolo_model is None:
+        _yolo_device = get_device()
+        _yolo_model = YOLO(YOLO_MODEL_PATH).to(_yolo_device)
+        logger.info(f"YOLO model cached on {_yolo_device} - will reuse for all frames")
+    return _yolo_model, _yolo_device
+
 # --- Object Detection Helper Functions ---
 def get_available_classes(model):
-    """Retrieve the list of available classes from the YOLO model."""
+    """
+    Retrieve the list of available classes from the YOLO model.
+    
+    Args:
+        model: YOLO model instance
+    
+    Returns:
+        dict: Dictionary mapping class indices to class names
+    """
     return model.names
 
-# def preprocess_image(image_path, max_size=(800, 800), quality=100):
-#     with Image.open(image_path) as img:
-#         img.thumbnail(max_size)
-#         img_byte_arr = io.BytesIO()
-#         img.save(img_byte_arr, format='JPEG', quality=quality)
-#         img_byte_arr.seek(0)
-#         return img_byte_arr
+# --- Cropping and Saving Functions ---
+def extract_plate_crop(source_img, full_component_data, truck_face):
+    """
+    Extract plate crop from source image if plate is detected.
+    
+    Args:
+        source_img: Source image as NumPy array (HxWxC)
+        full_component_data: Raw detection data dictionary from YOLO
+        truck_face: Detected truck face ("truck_front", "truck_back", or "unknown")
+    
+    Returns:
+        numpy.ndarray | None: Cropped plate region as image array, or None if plate not detected/invalid
+    """
+    plate_crop = None
+    if truck_face in ("truck_front", "truck_back") and 'plate_number' in full_component_data:
+        plate_entry = full_component_data['plate_number']
+        if plate_entry['confidences'] and len(plate_entry['boxes']) > 0:
+            x1, y1, x2, y2 = [int(coord) for coord in plate_entry['boxes'][0]]
+            h, w = source_img.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 > x1 and y2 > y1:
+                plate_crop = source_img[y1:y2, x1:x2]
+                logger.info("Plate region cropped successfully")
+            else:
+                logger.warning("Invalid plate crop coordinates")
+    return plate_crop
+
+# --- Cropping and Saving Functions ---
+def save_cropped_detections(image, component_data, frame_id=None):
+    """
+    Save cropped regions of all detected objects for validation and debugging.
+    
+    Args:
+        image: Source image/frame as NumPy array
+        component_data: Detection data dictionary grouped by component type
+        frame_id (int | None): Frame number for filename (None for single images)
+    
+    Returns:
+        None: Saves cropped images to CROPPED_PARTS_PATH directory
+    """
+    if image is None:
+        logger.warning("Could not load image/frame for cropping")
+        return
+        
+    # Create output directory if it doesn't exist
+    os.makedirs(CROPPED_PARTS_PATH, exist_ok=True)
+
+    h, w = image.shape[:2]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    crop_index = 0
+
+    for class_name, data in component_data.items():
+        for i, (conf, bbox) in enumerate(zip(data['confidences'], data['boxes'])):
+            x1, y1, x2, y2 = [float(coord) for coord in bbox]
+            # Clamp coordinates to image boundaries
+            x1, y1 = max(0, int(x1)), max(0, int(y1))
+            x2, y2 = min(w, int(x2)), min(h, int(y2))
+            
+            # Skip invalid crops
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            crop = image[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            # Format: {timestamp}[_frame{frame_id}]_{class}_{confidence:.2f}_{index}.jpg
+            if frame_id is not None:
+                filename = f"{timestamp}_frame{frame_id}_{class_name}_{conf:.2f}_{crop_index}.jpg"
+            else:
+                filename = f"{timestamp}_{class_name}_{conf:.2f}_{crop_index}.jpg"
+                
+            filepath = os.path.join(CROPPED_PARTS_PATH, filename)
+            cv2.imwrite(filepath, crop)
+            crop_index += 1
 
 # --- Core Detection and Tracking Function ---
 def detect_or_track_objects(source, is_video=False, frame_id=0):
-    """Detect objects in image or track objects in video frame."""
-    # Auto-select device (GPU if available, else CPU)
-    device = get_device()
-
-    # Load YOLO model and move to appropriate device
-    model = YOLO(YOLO_MODEL_PATH)
-    model.to(device)
+    """
+    Detect objects in image or track objects in video frame using YOLO.
+    
+    Args:
+        source: Image path, video frame, or camera feed
+        is_video (bool): True for video/camera processing (enables tracking), False for single image
+        frame_id (int): Frame number for logging purposes (default: 0)
+    
+    Returns:
+        tuple: (json_output, annotated_image, component_data) or (None, None, None) on failure
+            - json_output: Dictionary containing truck face and component detection results
+            - annotated_image: Image with bounding boxes drawn
+            - component_data: Raw detection data grouped by component type
+    """
+    # Use CACHED model instead of reloading every frame
+    model, device = get_cached_yolo_model()
     
     # Use tracking for video, detection for image
     if is_video:
@@ -167,6 +280,7 @@ def detect_or_track_objects(source, is_video=False, frame_id=0):
         "truck_face": truck_face,
         "truck_components": {}
     }
+
     for comp in expected_components:
         count = len(component_data.get(comp, {}).get('confidences', []))
         confs = component_data.get(comp, {}).get('confidences', [])
@@ -184,73 +298,6 @@ def detect_or_track_objects(source, is_video=False, frame_id=0):
 
     return json_output, annotated_image, component_data
 
-# --- Cropping and Saving Functions ---
-def extract_plate_crop(source_img, full_component_data, truck_face):
-    """
-    Extract plate crop from source image if plate is detected.
-    
-    Args:
-        source_img: Source image (NumPy array)
-        full_component_data: Raw detection data
-        truck_face: Detected truck face
-        
-    Returns:
-        plate_crop: Cropped plate image or None
-    """
-    plate_crop = None
-    if truck_face in ("truck_front", "truck_back") and 'plate_number' in full_component_data:
-        plate_entry = full_component_data['plate_number']
-        if plate_entry['confidences'] and len(plate_entry['boxes']) > 0:
-            x1, y1, x2, y2 = [int(coord) for coord in plate_entry['boxes'][0]]
-            h, w = source_img.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-            if x2 > x1 and y2 > y1:
-                plate_crop = source_img[y1:y2, x1:x2]
-                logger.info("Plate region cropped successfully")
-            else:
-                logger.warning("Invalid plate crop coordinates")
-    return plate_crop
-
-# --- Cropping and Saving Functions ---
-def save_cropped_detections(image, component_data, frame_id=None):
-    """Save cropped regions of all detected objects for validation."""
-    if image is None:
-        logger.warning("Could not load image/frame for cropping")
-        return
-        
-    # Create output directory if it doesn't exist
-    os.makedirs(CROPPED_PARTS_PATH, exist_ok=True)
-
-    h, w = image.shape[:2]
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    crop_index = 0
-    for class_name, data in component_data.items():
-        for i, (conf, bbox) in enumerate(zip(data['confidences'], data['boxes'])):
-            x1, y1, x2, y2 = [float(coord) for coord in bbox]
-            # Clamp coordinates to image boundaries
-            x1, y1 = max(0, int(x1)), max(0, int(y1))
-            x2, y2 = min(w, int(x2)), min(h, int(y2))
-            
-            # Skip invalid crops
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            crop = image[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-
-            # Format: {timestamp}[_frame{frame_id}]_{class}_{confidence:.2f}_{index}.jpg
-            if frame_id is not None:
-                filename = f"{timestamp}_frame{frame_id}_{class_name}_{conf:.2f}_{crop_index}.jpg"
-            else:
-                filename = f"{timestamp}_{class_name}_{conf:.2f}_{crop_index}.jpg"
-                
-            filepath = os.path.join(CROPPED_PARTS_PATH, filename)
-            cv2.imwrite(filepath, crop)
-            crop_index += 1
-
 # --- Diagnostic Processing and Saving ---
 def process_diagnostics_and_save(
     truck_face, 
@@ -259,40 +306,58 @@ def process_diagnostics_and_save(
     plate_crop, 
     source_info,
     is_video=False,
-    frame_id=0
+    frame_id=0,
+    save_to_disk=True
 ):
     """
     Process diagnostics and save results for both image and video modes.
     
     Args:
         truck_face: Detected truck face ("truck_front", "truck_back", or "unknown")
-        components: Component data for diagnostics
-        full_component_data: Raw component data with boxes and confidences
-        plate_crop: Cropped plate image (if available)
+        components: Component data for diagnostics (subset of full_component_data)
+        full_component_data: Raw component data with boxes and confidences from YOLO
+        plate_crop: Cropped plate image (NumPy array) or None if not detected
         source_info: Dict with source information (image name or frame details)
         is_video: Boolean indicating if processing video frame
         frame_id: Frame number (for video mode)
+        save_to_disk (bool): If False, processes diagnostics but skips disk write (for intermediate frames)
         
     Returns:
-        tuple: (diagnostics_log, extracted_plate_number, enhanced_components)
+        tuple: (diagnostics_log, enhanced_components)
+            - diagnostics_log: List of diagnostic messages with status emojis
+            - enhanced_components: Dictionary with enhanced component data including OCR results
     """
     # Run diagnostics based on truck face
     diagnostics_log = []
-    extracted_plate_number = None
+    plate_num = None
+    plate_ocr_conf = 0.0
 
     if truck_face == "truck_back":
         logger.info("Running back diagnostics")
-        diag_messages, plate_num = run_back_diagnostics(components, plate_crop, reader)
+        diag_messages, plate_num, plate_ocr_conf = run_back_diagnostics(components, plate_crop, reader)  # REVISED
         diagnostics_log = diag_messages
     elif truck_face == "truck_front":
         logger.info("Running front diagnostics")
-        diag_messages, plate_num = run_front_diagnostics(components, plate_crop, reader)
+        diag_messages, plate_num, plate_ocr_conf = run_front_diagnostics(components, plate_crop, reader)  # REVISED
         diagnostics_log = diag_messages
     else:
         msg = "truck face not detected — no diagnostics performed"
         print(msg)
         logger.warning(msg)
         diagnostics_log = [msg]
+
+    # --- LOG WEIGHTED COMBINED SCORE (YOLO*0.60 + OCR*0.40) FOR PLATE ---
+    if plate_num and truck_face in ("truck_front", "truck_back") and 'plate_number' in full_component_data:
+        plate_entry = full_component_data['plate_number']
+        yolo_confs = plate_entry.get('confidences', [])
+        if yolo_confs:
+            yolo_conf = yolo_confs[0]  # Expected count = 1 for plate_number
+            combined_score = (YOLO_CONFIDENCE_WEIGHT * yolo_conf) + (OCR_CONFIDENCE_WEIGHT * plate_ocr_conf)
+            logger.info(f"Plate '{plate_num}': YOLO={yolo_conf:.2f} ({int(YOLO_CONFIDENCE_WEIGHT*100)}%), "
+                    f"OCR={plate_ocr_conf:.2f} ({int(OCR_CONFIDENCE_WEIGHT*100)}%), "
+                    f"combined={combined_score:.2f}")
+        else:
+            logger.info(f"Plate '{plate_num}': OCR={plate_ocr_conf:.2f} (YOLO confidence unavailable)")
 
     # Print diagnostics to console
     for msg in diagnostics_log:
@@ -315,475 +380,519 @@ def process_diagnostics_and_save(
         # Include track_ids if available (for consistency)
         if 'track_ids' in raw_data and raw_data['track_ids']:
             comp_entry["track_ids"] = [tid for tid in raw_data['track_ids'] if tid is not None]
+        
+        # Store OCR confidence separately for plate_number
         if comp == 'plate_number' and plate_num is not None:
             comp_entry["number"] = plate_num
+            comp_entry["ocr_confidence"] = round(plate_ocr_conf, 2)
+        
         enhanced_components[comp] = comp_entry
 
-    # Save diagnostics to JSON file
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs(DIAGNOSTICS_PATH, exist_ok=True)
+    # ONLY save diagnostics to JSON file if explicitly requested
+    if save_to_disk:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs(DIAGNOSTICS_PATH, exist_ok=True)
 
-    if is_video:
-        diag_output_path = os.path.join(DIAGNOSTICS_PATH, f"diagnostics_{timestamp}_frame{frame_id}.json")
-        diagnostic_results = {
-            "frame_id": frame_id,
-            "truck_face": truck_face,
-            "truck_components": enhanced_components,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "diagnostics": diagnostics_log
-        }
+        if is_video:
+            diag_output_path = os.path.join(DIAGNOSTICS_PATH, f"diagnostics_{timestamp}_frame{frame_id}.json")
+        else:
+            diag_output_path = os.path.join(DIAGNOSTICS_PATH, f"diagnostics_{timestamp}.json")
+
+        with open(diag_output_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                "frame_id": frame_id,
+                "truck_face": truck_face,
+                "truck_components": enhanced_components,
+                "timestamp": datetime.now().isoformat(),
+                "diagnostics": diagnostics_log
+            }, f, indent=2, ensure_ascii=False)
+        logger.info(f"Diagnostic results saved to: {diag_output_path}")
     else:
-        diag_output_path = os.path.join(DIAGNOSTICS_PATH, f"diagnostics_{timestamp}.json")
-        diagnostic_results = {
-            "frame_id": 0,
-            "image": source_info.get("image_name", "unknown"),
-            "truck_face": truck_face,
-            "truck_components": enhanced_components,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "diagnostics": diagnostics_log
-        }
-
-    with open(diag_output_path, 'w', encoding='utf-8') as f:
-        json.dump(diagnostic_results, f, indent=2, ensure_ascii=False)
-    logger.info(f"Enhanced diagnostic results saved to: {diag_output_path}")
+        logger.debug("Diagnostics processed but not saved to disk (intermediate frame)")
 
     return diagnostics_log, enhanced_components
 
-# --- NEW: Diagnostic History Tracker with Ignore Period ---
-class DiagnosticHistory:
-    """Track diagnostic history and compute consensus decisions with ignore period."""
+# --- Final Consensus Diagnostics Saving ---
+def save_final_consensus_diagnostics(
+    diagnosis_timestamp: str,
+    truck_face: str,
+    consensus_components: dict,
+    diagnostics_ok: list,
+    diagnostics_ng: list
+):
+    """
+    Save final consensus diagnostics with meaningful filename containing plate number.
     
-    def __init__(self, consensus_window_seconds=CONSENSUS_WINDOW_SECONDS, ignore_period_seconds=IGNORE_PERIOD_SECONDS):
-        self.consensus_window = consensus_window_seconds
-        self.ignore_period = ignore_period_seconds
-        self.diagnostic_history = []  # List of (timestamp, diagnostics_dict)
-        self.component_history = {}   # Track each component's states over time
-        self.processing_start_time = None
+    Args:
+        diagnosis_timestamp: ISO 8601 timestamp when diagnostic operation started
+        truck_face: Detected truck face ("truck_front", "truck_back", or "unknown")
+        consensus_components: Dictionary of consensus component states and data
+        diagnostics_ok: List of passing component diagnostic messages (✅)
+        diagnostics_ng: List of failing component diagnostic messages (❌/⚠️)
+    
+    Returns:
+        str: Path to saved consensus diagnostic JSON file
+    """
+    # Parse date/time for filename
+    try:
+        dt = datetime.strptime(diagnosis_timestamp, "%Y-%m-%d %H:%M:%S")
+        date_str = dt.strftime("%Y%m%d")
+        time_str = dt.strftime("%H%M%S")
+    except:
+        date_str = datetime.now().strftime("%Y%m%d")
+        time_str = datetime.now().strftime("%H%M%S")
+    
+    # Extract plate number from consensus_components (canonical location)
+    plate_number = consensus_components.get("plate_number", {}).get("number", "")
+
+    # Clean plate number for filename with multi-stage fallback
+    plate_clean = ""
+    if plate_number and isinstance(plate_number, str) and plate_number.strip():
+        # Stage 1: Try ASCII alphanumeric extraction (standard case)
+        plate_clean = re.sub(r'[^A-Z0-9]', '', plate_number.upper())
         
-    def set_start_time(self, start_time):
-        """Set the processing start time for ignore period calculation."""
-        self.processing_start_time = start_time
+        # Stage 2: If empty after Stage 1, try Unicode digit extraction (handles full-width/zero-width artifacts)
+        if not plate_clean:
+            # Extract ANY digit characters (Unicode-aware via str.isdigit())
+            digits = ''.join(ch for ch in plate_number if ch.isdigit())
+            if digits:
+                plate_clean = digits[:8]  # Limit to 8 digits for filename safety
+            else:
+                # Stage 3: Fallback to first 8 alphanumeric characters (any script)
+                alnum_chars = [ch for ch in plate_number if ch.isalnum()]
+                if alnum_chars:
+                    plate_clean = ''.join(alnum_chars[:8]).upper()
+    
+    # Final fallback if all cleaning stages failed
+    if not plate_clean:
+        plate_clean = "UNKNOWN"
+
+    # Generate filename: final_20260127_143522_ABC123.json
+    filename = f"final_{date_str}_{time_str}_{plate_clean}.json"
+    diag_output_path = os.path.join(DIAGNOSTICS_PATH, filename)
+    
+    # Build final diagnostic structure with consensus metadata
+    final_diagnostics = {
+        "diagnosis_timestamp": diagnosis_timestamp,
+        "truck_face": truck_face,
+        "truck_components": consensus_components,
+        "diagnostics_ok": diagnostics_ok,
+        "diagnostics_ng": diagnostics_ng,
+        "consensus_window_seconds": CONSENSUS_WINDOW_SECONDS,
+        "ignore_period_seconds": IGNORE_PERIOD_SECONDS,
+        "input_mode": INPUT_MODE
+    }
+    
+    # ALWAYS save final consensus diagnostics
+    os.makedirs(DIAGNOSTICS_PATH, exist_ok=True)
+    with open(diag_output_path, 'w', encoding='utf-8') as f:
+        json.dump(final_diagnostics, f, indent=2, ensure_ascii=False)
+    
+    logger.info(f"✅ FINAL CONSENSUS DIAGNOSTICS SAVED: {filename}")
+    return diag_output_path
+
+def process_single_image(image_path: str, diagnosis_timestamp: str) -> dict | None:
+    """
+    Complete diagnostic pipeline for a single image from detection to final report.
+    
+    Args:
+        image_path: Path to input image file
+        diagnosis_timestamp: ISO 8601 timestamp when diagnostic operation started
+    
+    Returns:
+        dict | None: Result dictionary with diagnostics or None on failure
+            - truck_face: Detected truck face ("truck_front" or "truck_back")
+            - truck_components: Enhanced component data with counts/confidences/plate number
+            - diagnostics_ok: List of passing component diagnostic messages (✅)
+            - diagnostics_ng: List of failing component diagnostic messages (❌/⚠️)
+            - final_diagnostic_file: Path to saved consensus diagnostic JSON file
+    """
+    logger.info(f"Processing single image: {image_path}")
+    detected_json, annotated_image, full_component_data = detect_or_track_objects(image_path, is_video=False)
+    
+    if detected_json is None:
+        logger.error("Failed to process image")
+        return None
+
+    # Print and log detection summary    
+    logger.info(f"Detected truck face: {detected_json['truck_face']}")
+    # print(json.dumps(detected_json, indent=2))
+    
+    # Load source image for plate cropping
+    source_img = cv2.imread(image_path)
+    if source_img is None:
+        logger.warning("Failed to load source image for plate cropping")
+    
+    # Extract plate crop
+    plate_crop = extract_plate_crop(source_img, full_component_data, detected_json["truck_face"])
+    
+    # Process diagnostics and save results
+    source_info = {"image_name": os.path.basename(image_path)}
+    diagnostics_log, enhanced_components = process_diagnostics_and_save(
+        detected_json["truck_face"],
+        detected_json["truck_components"],
+        full_component_data,
+        plate_crop,
+        source_info,
+        is_video=False,
+        save_to_disk=True
+    )
+
+    # Optional cropped detections
+    if SAVE_CROPS:
+        logger.info("Saving cropped detections to 'cropped_parts/' directory")
+        save_cropped_detections(source_img, full_component_data)
+    
+    # Display image if not headless
+    if annotated_image is not None:
+        try:
+            cv2.imshow('Annotated Image', annotated_image)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        except Exception as e:
+            logger.info(f"Display unavailable (headless environment or missing GUI backend) - skipping image display: {type(e).__name__}: {e}")
+    else:
+        logger.warning("No annotated image available for display")
+    
+    # Split diagnostics into OK and NG and compile results
+    diagnostics_ok = [m for m in diagnostics_log if m.startswith("✅")]
+    diagnostics_ng = [m for m in diagnostics_log if m.startswith(("❌", "⚠️"))]
+    
+    # Save final consensus for image mode (same as intermediate since single frame)
+    final_diag_path = save_final_consensus_diagnostics(
+        diagnosis_timestamp=diagnosis_timestamp,
+        truck_face=detected_json["truck_face"],
+        consensus_components=enhanced_components,
+        diagnostics_ok=diagnostics_ok,
+        diagnostics_ng=diagnostics_ng
+    )
+
+    # Store result for return after cleanup
+    return {
+        "truck_face": detected_json["truck_face"],
+        "truck_components": enhanced_components,
+        "diagnostics_ok": diagnostics_ok,
+        "diagnostics_ng": diagnostics_ng,
+        "final_diagnostic_file": final_diag_path
+    }
+
+def process_video_source(
+    source_path: str | int, 
+    is_camera: bool = False, 
+    camera_index: int = 0,
+    consensus_window: int = CONSENSUS_WINDOW_SECONDS,
+    ignore_period: int = IGNORE_PERIOD_SECONDS,
+    save_interval: float = SAVE_INTERVAL_SECONDS
+) -> tuple:
+    """
+    Process video file or camera stream with temporal consensus tracking over multiple frames.
+    
+    Args:
+        source_path: Video file path (str) or camera index (int) if is_camera=True
+        is_camera: True for live camera feed, False for video file processing
+        camera_index: Camera device index (only used if is_camera=True)
+        consensus_window: Duration in seconds for temporal consensus window (default: 18)
+        ignore_period: Duration in seconds to ignore at start of stream for stabilization (default: 1)
+        save_interval: Interval in seconds between diagnostic saves during processing (default: 2.5)
+    
+    Returns:
+        tuple: (consensus_result, success)
+            - consensus_result: Tuple from DiagnosticHistory.get_consensus_diagnostics() or None
+                (diagnostics, truck_face, components, ok_list, ng_list)
+            - success: True if stream processed successfully, False on failure
+    """
+    # Initialize video capture
+    cap = cv2.VideoCapture(camera_index if is_camera else source_path)
+    source_desc = f"camera device {camera_index}" if is_camera else f"video file: {source_path}"
+    if is_camera:
+        logger.info(f"Using camera device: {source_desc}")
+    else:
+        logger.info(f"Using video file: {source_desc}")
+
+    if not cap.isOpened():
+        logger.error("Failed to open video source")
+        return None, False
+    
+    try:
+        # Get video properties
+        fps = int(cap.get(cv2.CAP_PROP_FPS)) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-    def add_diagnostics(self, timestamp, diagnostics_result):
-        """Add diagnostic result to history."""
-        if self.processing_start_time is None:
-            self.processing_start_time = timestamp
+        # Initialize video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(VIDEO_OUTPUT_PATH, fourcc, fps, (frame_width, frame_height))
+        logger.info(f"Output video will be saved to: {VIDEO_OUTPUT_PATH}")
+        
+        # Initialize diagnostic history tracker with x sec consensus window and y sec ignore period
+        diagnostic_history = DiagnosticHistory(
+            consensus_window_seconds=consensus_window,
+            ignore_period_seconds=ignore_period
+        )
+        processing_start_time = datetime.now().timestamp()
+        diagnostic_history.set_start_time(processing_start_time)
+        
+        # Processing loop
+        last_save_time = datetime.now()
+        frame_count = 0
+        last_annotated_frame = None    
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                logger.info("End of video stream")
+                break
             
-        # Store full diagnostic result
-        self.diagnostic_history.append((timestamp, diagnostics_result))
-        
-        # Update component history
-        for component, data in diagnostics_result.get("truck_components", {}).items():
-            if component not in self.component_history:
-                self.component_history[component] = []
+            frame_count += 1
+            current_time = datetime.now()
             
-            # Determine component state
-            state = self._get_component_state(component, data)
-            self.component_history[component].append((timestamp, state))
-        
-        # Clean up old entries (keep full consensus window)
-        self._cleanup_old_entries(timestamp)
-    
-    def _get_component_state(self, component, data):
-        """Determine the state of a component based on diagnostic rules."""
-        count = data.get("count", 0)
-        confidences = data.get("confidence", [])
-        
-        if component == "plate_number":
-            # Plate number state depends on OCR success
-            if "number" in data:
-                return "✅"
-            elif count >= EXPECTED_COMPONENT_COUNTS.get(component, 1) and all(c >= DIAGNOSTIC_THRESHOLD for c in confidences):
-                return "⚠️"
-            else:
-                return "❌"
-        
-        # For other components
-        expected_count = EXPECTED_COMPONENT_COUNTS.get(component, 1)
-        if count < expected_count or any(c < DIAGNOSTIC_THRESHOLD for c in confidences):
-            return "❌"
-        else:
-            return "✅"
-    
-    def _cleanup_old_entries(self, current_time):
-        """Remove entries older than consensus window."""
-        cutoff_time = current_time - self.consensus_window
-        self.diagnostic_history = [
-            (ts, diag) for ts, diag in self.diagnostic_history 
-            if ts >= cutoff_time
-        ]
-        
-        for component in self.component_history:
-            self.component_history[component] = [
-                (ts, state) for ts, state in self.component_history[component]
-                if ts >= cutoff_time
-            ]
-    
-    def get_consensus_diagnostics(self):
-        """Get consensus diagnostic messages based on history (excluding ignore period)."""
-        if not self.diagnostic_history or self.processing_start_time is None:
-            return None, None, None, None
-        
-        # Calculate usable time window
-        current_time = datetime.datetime.now().timestamp()
-        ignore_cutoff = self.processing_start_time + self.ignore_period
-        window_end = current_time
-        window_start = max(ignore_cutoff, current_time - self.consensus_window)
-        
-        # Filter diagnostic history to usable window
-        usable_diagnostics = [
-            (ts, diag) for ts, diag in self.diagnostic_history
-            if ts >= window_start and ts <= window_end
-        ]
-        
-        if not usable_diagnostics:
-            # No usable data, return latest available
-            latest_diag = self.diagnostic_history[-1][1]
-            return self._build_diagnostics_from_result(latest_diag)
-        
-        # Use the most recent truck face from usable data
-        latest_usable_diag = usable_diagnostics[-1][1]
-        truck_face = latest_usable_diag["truck_face"]
-        
-        # Build consensus component states from usable window only
-        consensus_components = {}
-        consensus_diagnostics = []
-        
-        # Determine which components to check based on truck face
-        expected_components = self._get_expected_components(truck_face)
-        
-        for component in expected_components:
-            # Filter component history to usable window
-            if component in self.component_history:
-                usable_component_history = [
-                    (ts, state) for ts, state in self.component_history[component]
-                    if ts >= window_start and ts <= window_end
-                ]
-            else:
-                usable_component_history = []
+            # Detect/track objects
+            detected_json, annotated_frame, full_component_data = detect_or_track_objects(
+                frame, is_video=True, frame_id=frame_count
+            )
             
-            if usable_component_history:
-                # Get most frequent state in the usable window
-                states = [state for _, state in usable_component_history]
-                state_counts = {}
-                for state in states:
-                    state_counts[state] = state_counts.get(state, 0) + 1
-                
-                # Get most common state
-                consensus_state = max(state_counts, key=state_counts.get)
-                
-                # Build diagnostic message
-                message = self._build_consensus_message(component, consensus_state)
-                consensus_diagnostics.append(message)
-                
-                # Use latest component data from usable window
-                latest_component_data = latest_usable_diag["truck_components"].get(component, {})
-                consensus_components[component] = latest_component_data
-                
+            if detected_json is None:
+                annotated_frame = frame.copy()
+                last_annotated_frame = annotated_frame
             else:
-                # No usable data for this component, use latest available
-                latest_component_data = latest_usable_diag["truck_components"].get(component, {})
-                consensus_components[component] = latest_component_data
+                last_annotated_frame = annotated_frame
+            
+            # Run diagnostics every SAVE_INTERVAL_SECONDS
+            if (current_time - last_save_time).total_seconds() >= save_interval:
+                last_save_time = current_time
                 
-                # Build message based on latest data
-                if latest_component_data:
-                    state = self._get_component_state(component, latest_component_data)
-                    message = self._build_consensus_message(component, state)
-                else:
-                    message = f"❓ {component}: no usable data"
-                consensus_diagnostics.append(message)
+                # Extract plate crop
+                plate_crop = extract_plate_crop(frame, full_component_data, detected_json["truck_face"])
+                source_info = {"frame_id": frame_count, "timestamp": current_time.isoformat()}
+
+                # Process diagnostics but only save if debugging
+                diagnostics_log, enhanced_components = process_diagnostics_and_save(
+                    detected_json["truck_face"],
+                    detected_json["truck_components"],
+                    full_component_data,
+                    plate_crop,
+                    source_info,
+                    is_video=True,
+                    frame_id=frame_count,
+                    save_to_disk=SAVE_INTERMEDIATE_DIAGNOSTICS
+                )
+                
+                # Save cropped detections if enabled
+                if SAVE_CROPS:
+                    save_cropped_detections(frame, full_component_data, frame_count)
+                
+                # Add to diagnostic history with current timestamp
+                diagnostic_entry = {
+                    "frame_id": frame_count,
+                    "truck_face": detected_json["truck_face"],
+                    "truck_components": enhanced_components,
+                    "timestamp": current_time.isoformat(),
+                    "diagnostics": diagnostics_log
+                }
+                diagnostic_history.add_diagnostics(current_time.timestamp(), diagnostic_entry)
+
+                       # Write frame and display (camera only)
+            if last_annotated_frame is not None:
+                video_writer.write(last_annotated_frame)
+            
+            # Display real-time video (only for camera mode to avoid video playback lag)
+            if is_camera:
+                try:
+                    display_frame = last_annotated_frame if last_annotated_frame is not None else frame
+                    if display_frame is not None:
+                        cv2.imshow('Truck Diagnostic - Live', display_frame)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            logger.info("User requested exit")
+                            break
+                except Exception as e:
+                    # Expected in headless environments - log at INFO level, not WARNING
+                    logger.info(f"Display unavailable (headless environment or missing GUI backend) - continuing without live preview: {type(e).__name__}: {e}")
         
-        return consensus_diagnostics, truck_face, consensus_components
+        # Get consensus after stream ends
+        consensus_result = diagnostic_history.get_consensus_diagnostics()
+        return consensus_result, True
     
-    def _get_expected_components(self, truck_face):
-        """Get expected components based on truck face."""
-        if truck_face == "truck_front":
-            return list(FRONT_EXPECTED_COMPONENTS)
-        elif truck_face == "truck_back":
-            return list(BACK_EXPECTED_COMPONENTS)
-        else:
-            return list(EXPECTED_COMPONENT_COUNTS.keys())
+    finally:
+        # Cleanup resources
+        cap.release()
+        video_writer.release()
+        if is_camera:
+            cv2.destroyAllWindows()
+        logger.info("Video processing completed")
+
+def compile_final_results(
+    diagnosis_timestamp: str,
+    truck_face: str,
+    consensus_components: dict,
+    diagnostics_ok: list,
+    diagnostics_ng: list
+) -> dict:
+    """
+    Compile standardized result dictionary with final diagnostics for return to caller.
     
-    def _build_consensus_message(self, component, state):
-        """Build diagnostic message based on component and consensus state."""
-        component_names = {
-            'mirror': 'mirrors',
-            'light_front': 'front lights', 
-            'wiper': 'wipers',
-            'mirror_top': 'top mirror',
-            'plate_number': 'plate number',
-            'carrier': 'carrier',
-            'lift': 'lift',
-            'light_back': 'back lights',
-            'stand': 'stands'
-        }
-        
-        display_name = component_names.get(component, component)
-        
-        if state == "✅":
-            if component == "plate_number":
-                return f"✅ {display_name}: visible with number"
-            else:
-                return f"✅ {display_name}: ok"
-        elif state == "⚠️":
-            return f"⚠️ {display_name}: visible but could not be read"
-        else:  # "❌"
-            if component == "plate_number":
-                return f"❌ {display_name}: missing or obscured"
-            else:
-                return f"❌ {display_name}: missing/broken"
+    Args:
+        diagnosis_timestamp: ISO 8601 timestamp when diagnostic operation started
+        truck_face: Detected truck face ("truck_front", "truck_back", or "unknown")
+        consensus_components: Dictionary of consensus component states and data
+        diagnostics_ok: List of passing component diagnostic messages (✅)
+        diagnostics_ng: List of failing component diagnostic messages (❌/⚠️)
     
-    def _build_diagnostics_from_result(self, diagnostics_result):
-        """Build diagnostics from a single result (fallback)."""
-        truck_face = diagnostics_result["truck_face"]
-        enhanced_components = diagnostics_result["truck_components"]
-        diagnostics_log = diagnostics_result["diagnostics"]
-        
-        return diagnostics_log, truck_face, enhanced_components
+    Returns:
+        dict: Complete result dictionary ready for return
+            - truck_face: Detected truck face
+            - truck_components: Consensus component data
+            - diagnostics_ok: List of passing diagnostic messages
+            - diagnostics_ng: List of failing diagnostic messages
+            - final_diagnostic_file: Path to saved consensus diagnostic JSON file
+    """
+    final_diag_path = save_final_consensus_diagnostics(
+        diagnosis_timestamp=diagnosis_timestamp,
+        truck_face=truck_face,
+        consensus_components=consensus_components,
+        diagnostics_ok=diagnostics_ok,
+        diagnostics_ng=diagnostics_ng
+    )
+    
+    return {
+        "truck_face": truck_face,
+        "truck_components": consensus_components,
+        "diagnostics_ok": diagnostics_ok,
+        "diagnostics_ng": diagnostics_ng,
+        "final_diagnostic_file": final_diag_path
+    }
 
 # --- Main Execution Function ---
 def main():
     """
-    Main execution function for truck diagnostic pipeline.
+    Main execution function for truck diagnostic.
     
     Returns:
-        dict or None: Diagnostic results containing:
-            - diagnostics: list of diagnostic messages
-            - truck_face: detected truck face
-            - truck_components: component data with counts and confidence
-            - extracted_plate_number: OCR result (if successful)
-            Returns None if processing fails.
+        tuple: (diagnosis_timestamp, results_dict)
+            - diagnosis_timestamp: ISO 8601 timestamp when diagnostic operation started
+            - results_dict: Diagnostic results dictionary or None on complete failure
+                * truck_face: "truck_front", "truck_back", or "unknown"
+                * truck_components: Dict of component data with counts/confidences/plate number
+                * diagnostics_ok: List of passing components (✅ messages)
+                * diagnostics_ng: List of failing components (❌/⚠️ messages)
+                * final_diagnostic_file: Path to saved consensus JSON file
     """
     logger.info("Starting truck diagnostic pipeline")
     logger.info(f"Input mode: {INPUT_MODE}")
 
+    # --- PRE-FLIGHT VALIDATION WITH TIMESTAMP ON FAILURE ---
+    if INPUT_MODE not in ("image", "video", "camera"):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.error(f"Invalid INPUT_MODE: {INPUT_MODE}. Must be 'image', 'video', or 'camera'.")
+        return timestamp, None
+
+    if INPUT_MODE == "video" and not os.path.exists(VIDEO_FILE_PATH):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.error(f"Video file not found: {VIDEO_FILE_PATH}")
+        return timestamp, None
+
+    if INPUT_MODE == "image" and not os.path.exists(IMAGE_PATH):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.error(f"Image file not found: {IMAGE_PATH}")
+        return timestamp, None
+
+    # Initialize result variable
     result = None  # Store the return value
 
-    # # Preprocess the image
-    # logger.info(f"Preprocessing image: {IMAGE_PATH}")
-    # processed_image_bytes = preprocess_image(IMAGE_PATH)
-
-    # # Save to temporary file
-    # with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
-    #     temp_file.write(processed_image_bytes.getvalue())
-    #     temp_file_path = temp_file.name
+    # RECORD TIMESTAMP: Start of diagnostic operation (after validation)
+    diagnosis_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
         if INPUT_MODE == "image":
             # Single image processing
-            logger.info(f"Processing single image: {IMAGE_PATH}")
-            detected_json, annotated_image, full_component_data = detect_or_track_objects(IMAGE_PATH, is_video=False)
-            
-            if detected_json is None:
-                logger.error("Failed to process image")
-                return None
-                
-            # Print and log detection summary
-            logger.info(f"Detected truck face: {detected_json['truck_face']}")
-            # print(json.dumps(detected_json, indent=2))
-
-            # Load source image for plate cropping
-            source_img = cv2.imread(IMAGE_PATH)
-            if source_img is None:
-                logger.warning("Failed to load source image for plate cropping")
-
-            # Extract plate crop
-            plate_crop = extract_plate_crop(source_img, full_component_data, detected_json["truck_face"])
-            
-            # Process diagnostics and save results
-            source_info = {"image_name": os.path.basename(IMAGE_PATH)}
-            diagnostics_log, enhanced_components = process_diagnostics_and_save(
-                detected_json["truck_face"],
-                detected_json["truck_components"],
-                full_component_data,
-                plate_crop,
-                source_info,
-                is_video=False
-            )
-
-            # --- Optional: Save cropped detections for validation ---
-            if SAVE_CROPS:
-                logger.info("Saving cropped detections to 'cropped_parts/' directory")
-                save_cropped_detections(source_img, full_component_data)
-
-            # Display image
-            logger.info("Displaying annotated image")
-            cv2.imshow('Annotated Image', annotated_image)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-
-            # Split diagnostics into OK and NG
-            diagnostics_ok = [m for m in diagnostics_log if m.startswith("✅")]
-            diagnostics_ng = [m for m in diagnostics_log if m.startswith(("❌", "⚠️"))]
-
-            # Store result for return after cleanup
-            result = {
-                "truck_face": detected_json["truck_face"],
-                "truck_components": enhanced_components,
-                "diagnostics_ok": diagnostics_ok,
-                "diagnostics_ng": diagnostics_ng
-            }
+            logger.info("Starting single image processing")
+            result = process_single_image(IMAGE_PATH, diagnosis_timestamp)
     
         elif INPUT_MODE in ("camera", "video"):
             # Video/Camera processing
             logger.info("Starting video/camera processing")
-            
-            # Initialize video capture
-            if INPUT_MODE == "camera":
-                cap = cv2.VideoCapture(CAMERA_INDEX)
-                logger.info(f"Using camera device {CAMERA_INDEX}")
-            else:  # INPUT_MODE == "video"
-                if not os.path.exists(VIDEO_FILE_PATH):
-                    logger.error(f"Video file not found: {VIDEO_FILE_PATH}")
-                    return None
-                cap = cv2.VideoCapture(VIDEO_FILE_PATH)
-                logger.info(f"Using video file: {VIDEO_FILE_PATH}")
+            consensus_result, success = process_video_source(
+                source_path=CAMERA_INDEX if INPUT_MODE == "camera" else VIDEO_FILE_PATH,
+                is_camera=(INPUT_MODE == "camera"),
+                camera_index=CAMERA_INDEX,
+                consensus_window=CONSENSUS_WINDOW_SECONDS,
+                ignore_period=IGNORE_PERIOD_SECONDS,
+                save_interval=SAVE_INTERVAL_SECONDS
+            )        
 
-            if not cap.isOpened():
-                logger.error("Failed to open video source")
-                return None
+            # Compile final results if successful consensus obtained
+            if success and consensus_result[0] is not None:
+                consensus_diagnostics, truck_face, consensus_components, diagnostics_ok, diagnostics_ng = consensus_result
 
-            # Get video properties
-            fps = int(cap.get(cv2.CAP_PROP_FPS)) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
-            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
-            # Initialize video writer
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            video_writer = cv2.VideoWriter(VIDEO_OUTPUT_PATH, fourcc, fps, (frame_width, frame_height))
-            logger.info(f"Output video will be saved to: {VIDEO_OUTPUT_PATH}")
-
-            # Initialize diagnostic history tracker with 20s window and 2s ignore period
-            diagnostic_history = DiagnosticHistory(
-                consensus_window_seconds=CONSENSUS_WINDOW_SECONDS, 
-                ignore_period_seconds=IGNORE_PERIOD_SECONDS
-            )
-            processing_start_time = datetime.datetime.now().timestamp()
-            diagnostic_history.set_start_time(processing_start_time)
-
-            # Timing for JSON saving interval
-            last_save_time = datetime.datetime.now()
-            frame_count = 0
-            last_annotated_frame = None
-
-            try:
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        logger.info("End of video stream")
-                        break
-
-                    frame_count += 1
-                    current_time = datetime.datetime.now()
-
-                    # Track objects in frame using built-in YOLO tracking
-                    detected_json, annotated_frame, full_component_data = detect_or_track_objects(
-                        frame, is_video=True, frame_id=frame_count
-                    )
-
-                    if detected_json is None:
-                        # No detections, use original frame
-                        annotated_frame = frame.copy()
-                        last_annotated_frame = annotated_frame
-                    else:
-                        last_annotated_frame = annotated_frame
-                        
-                        # Run diagnostics every SAVE_INTERVAL_SECONDS
-                        current_time = datetime.datetime.now()
-                        if (current_time - last_save_time).total_seconds() >= SAVE_INTERVAL_SECONDS:
-                            last_save_time = current_time
-                            
-                            # Extract plate crop
-                            plate_crop = extract_plate_crop(frame, full_component_data, detected_json["truck_face"])
-                            
-                            # Process diagnostics and save results
-                            source_info = {"frame_id": frame_count}
-                            diagnostics_log, enhanced_components = process_diagnostics_and_save(
-                                detected_json["truck_face"],
-                                detected_json["truck_components"],
-                                full_component_data,
-                                plate_crop,
-                                source_info,
-                                is_video=True,
-                                frame_id=frame_count
-                            )
-
-                            # Save cropped detections if enabled
-                            if SAVE_CROPS:
-                                save_cropped_detections(frame, full_component_data, frame_count)
-
-                            # Add to diagnostic history
-                            diagnostic_result = {
-                                "truck_face": detected_json["truck_face"],
-                                "truck_components": enhanced_components,
-                                "diagnostics": diagnostics_log
-                            }
-                            diagnostic_history.add_diagnostics(current_time.timestamp(), diagnostic_result)
-
-                    # Write annotated frame to video
-                    if last_annotated_frame is not None:
-                        video_writer.write(last_annotated_frame)
-                    
-                    # Display real-time video (only for camera mode to avoid video playback lag)
-                    if INPUT_MODE == "camera":
-                        cv2.imshow('Truck Diagnostic - Live', last_annotated_frame if last_annotated_frame is not None else frame)
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
-                            logger.info("User requested exit")
-                            break
-
-            finally:
-                # Cleanup video resources
-                cap.release()
-                video_writer.release()
-                if INPUT_MODE == "camera":
-                    cv2.destroyAllWindows()
-                logger.info("Video processing completed")
-
-            # Return consensus diagnostics after processing ends
-            consensus_diagnostics, truck_face, consensus_components = diagnostic_history.get_consensus_diagnostics()
-            
-            if consensus_diagnostics is not None:
-                # Embed plate number in consensus_components if available
+                # Split diagnostics into OK and NG
                 diagnostics_ok = [m for m in consensus_diagnostics if m.startswith("✅")]
                 diagnostics_ng = [m for m in consensus_diagnostics if m.startswith(("❌", "⚠️"))]
 
+                # Extract plate_number from consensus components BEFORE use
+                plate_number = consensus_components.get("plate_number", {}).get("number", "N/A")
+
+                # ALWAYS save final consensus diagnostics
+                final_diag_path = save_final_consensus_diagnostics(
+                    diagnosis_timestamp=diagnosis_timestamp,
+                    truck_face=truck_face,
+                    consensus_components=consensus_components,
+                    diagnostics_ok=diagnostics_ok,
+                    diagnostics_ng=diagnostics_ng
+                )
+
+                # Build result dict
                 result = {
                     "truck_face": truck_face,
                     "truck_components": consensus_components,
                     "diagnostics_ok": diagnostics_ok,
-                    "diagnostics_ng": diagnostics_ng
+                    "diagnostics_ng": diagnostics_ng,
+                    "final_diagnostic_file": final_diag_path
                 }
-            else:
-                result = None
 
+    except Exception as e:
+        logger.error(f"Processing failed: {e}")
+        return diagnosis_timestamp, None
+    
     finally:
         # Cleanup for both modes - THIS WILL ALWAYS RUN
-        # if os.path.exists(temp_file_path):
-        #     os.remove(temp_file_path)
-        #     logger.debug(f"Temporary file removed: {temp_file_path}")
         if os.path.exists(OUTPUT_IMAGE_PATH):
             os.remove(OUTPUT_IMAGE_PATH)
             logger.debug(f"Annotated image removed: {OUTPUT_IMAGE_PATH}")
         logger.info("Pipeline completed")
     
-    return result
+    return diagnosis_timestamp, result
 
 if __name__ == "__main__":
-    results = main()
+    diagnosis_timestamp, results = main()
+
+    # Display timestamp prominently
+    print(f"\n⏱️  Diagnosis performed at: {BLUE}{diagnosis_timestamp}{RESET}")
+    
     if results is None:
-        print("❌ Truck inspection failed: no results generated.")
+        print(f"{RED}❌ Truck inspection failed: no results generated.{RESET}")
+
     else:
-        results = main()
         truck_face = results["truck_face"]
         truck_components = results["truck_components"]
         diagnostics_ok = results["diagnostics_ok"]
         diagnostics_ng = results["diagnostics_ng"]
         plate_number = truck_components.get("plate_number", {}).get("number", "N/A")
-        print(f"\n✅ {ORANGE}This is the summary of the truck diagnosis:{RESET}\n{truck_face} \n{truck_components} \n{plate_number} \n{diagnostics_ok} \n{diagnostics_ng}")
+        final_diag_file = results.get("final_diagnostic_file", "N/A")
+
+        print(f"\n✅ {ORANGE}Truck diagnosis summary:{RESET}")
+        print(f"   Face: {truck_face}")
+        print(f"   Plate: {plate_number}")
+        print(f"   Components: {list(truck_components.keys())}")
+        print(f"   ✅ Passing components: {len(diagnostics_ok)}")
+        for msg in diagnostics_ok:
+            print(f"      {msg}")
+        print(f"   ❌/⚠️ Failing components: {len(diagnostics_ng)}")
+        for msg in diagnostics_ng:
+            print(f"      {msg}")
+        print(f"   📁 Final diagnostics: {os.path.basename(final_diag_file) if final_diag_file != 'N/A' else 'Not saved'}")
 
         if not diagnostics_ng:
-            print("✅ Truck passed inspection!")
+            print(f"\n{GREEN}✅ Truck passed inspection!{RESET}")
         else:
-            print(f"❌ Issues found: {len(diagnostics_ng)}")
+            print(f"\n{RED}🔧 Required repairs:{RESET}")
             for issue in diagnostics_ng:
                 print("  ", issue)
