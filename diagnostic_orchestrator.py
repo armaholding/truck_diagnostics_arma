@@ -1,7 +1,7 @@
-# Module names (must match filenames without .py)
 import logging
 import time
 from typing import Callable, Any, Optional
+from datetime import datetime
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -10,9 +10,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-QR_CODE_SCANNER = "qr_code_scannerrt"
-TRUCK_DIAGNOSER = "yolo_truckrt"
+QR_CODE_SCANNER = "qr_code_scanner_rt"
+TRUCK_DIAGNOSER = "yolo_truck_rt"
 AI_RECOMMENDER = "maintenance_bot"
+SESSION_TRACKER = "session_tracker"
 RATE_LIMIT_DELAY = 1.0  # seconds between stages to avoid overload
 
 BLUE = "\033[94m"
@@ -32,13 +33,23 @@ def import_main(module_name: str) -> Optional[Callable[..., Any]]:
     return None
 
 # === EXECUTE QUERY PIPELINE (CORE FUNCTIONALITY) ===
+# --- CRITICAL FIX: Initialize ALL timestamps upfront ---
+current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+qr_scan_timestamp = current_time_str
+diagnosis_timestamp = current_time_str
+recommendation_timestamp = current_time_str
+
 # --- STAGE 1: QR code scanner ---
 driver_names = None
 
 qs_main = import_main(QR_CODE_SCANNER)
 if qs_main:
     logger.info("🔹 Running qr_code_scanner to find relevant video...")
-    driver_names = qs_main()
+    try:
+        qr_scan_timestamp, driver_names = qs_main()  # CRITICAL: Wrapped in try/except
+    except Exception as e:
+        logger.error(f"QR scanner execution failed: {e}")
+        driver_names = None
 else:
     logger.critical("❌ Skipping qr_code_scanner: main() function not available")
 
@@ -61,19 +72,23 @@ plate_number = None
 yt_main = import_main(TRUCK_DIAGNOSER)
 if yt_main:
     logger.info("🔹 Running yolo_truck to get timestamped answer...")
-    results = yt_main()
-    if results is not None:
-        truck_face = results["truck_face"]
-        truck_components = results["truck_components"]
-        diagnostics_ok = results["diagnostics_ok"]
-        diagnostics_ng = results["diagnostics_ng"]
-        plate_number = truck_components.get("plate_number", {}).get("number", "N/A")
+    try:
+        diagnosis_timestamp, results = yt_main()  # CRITICAL: Wrapped in try/except
+        if results is not None:
+            truck_face = results["truck_face"]
+            truck_components = results["truck_components"]
+            diagnostics_ok = results["diagnostics_ok"]
+            diagnostics_ng = results["diagnostics_ng"]
+            plate_number = truck_components.get("plate_number", {}).get("number", "N/A")
+    except Exception as e:
+        logger.error(f"Truck diagnostics execution failed: {e}")
+        results = None
 else:
     logger.critical("❌ Skipping yolo_truck: main() function not available")
 
 # Handle output
 if results is not None:
-    logger.info(f"✅ Truck face timestamp: {truck_face}")
+    logger.info(f"✅ Truck face: {truck_face}")
     logger.info(f"✅ Plate number: {plate_number}")
     logger.info(f"✅ Truck components detected: {list(truck_components.keys())}")
     logger.info(f"✅ Diagnostics NG: {diagnostics_ng}")
@@ -91,10 +106,17 @@ maintenance_tips = None
 mb_main = import_main(AI_RECOMMENDER)
 if mb_main:
     logger.info("🔹 Running maintenance_bot to get recommendations...")
-    recommendations = mb_main(diagnostics_ok, diagnostics_ng)
-    if recommendations is not None:
-        repair_instructions = recommendations.get("fixes")
-        maintenance_tips = recommendations.get("maintenance")
+    # Ensure diagnostics are lists even on failure
+    safe_diagnostics_ok = diagnostics_ok if diagnostics_ok is not None else []
+    safe_diagnostics_ng = diagnostics_ng if diagnostics_ng is not None else []
+    try:
+        recommendation_timestamp, recommendations = mb_main(safe_diagnostics_ok, safe_diagnostics_ng)  # CRITICAL: Wrapped in try/except
+        if recommendations is not None:
+            repair_instructions = recommendations.get("fixes")
+            maintenance_tips = recommendations.get("maintenance")
+    except Exception as e:
+        logger.error(f"Maintenance bot execution failed: {e}")
+        recommendations = None
 else:
     logger.warning("❌ Skipping maintenance_bot: module not available")
 
@@ -104,17 +126,25 @@ if recommendations is not None:
 else:
     logger.warning("❌ No recommendations available")
 
-# --- Output Processing ---
+# --- Stage 4: Output Processing ---
+# Timestamps are ALWAYS defined (initialized upfront)
+try:
+    start_dt = datetime.strptime(qr_scan_timestamp, "%Y-%m-%d %H:%M:%S")
+    finish_dt = datetime.strptime(recommendation_timestamp, "%Y-%m-%d %H:%M:%S")
+    duration = (finish_dt - start_dt).total_seconds()
+    logger.info(f"⏱️  Total processing time: {duration:.1f} seconds")
+except Exception as e:
+    logger.warning(f"⚠️ Could not calculate duration: {e}")
+    logger.info(f"⏱️  Scan time: {qr_scan_timestamp}, Recommendation time: {recommendation_timestamp}")
+
 if driver_names is not None and results is not None and repair_instructions is not None:
     logger.info("🔹🔹🔹 REPORTING FINAL OUTPUT 🔹🔹🔹")
     # Extract driver name and plate number
     if isinstance(driver_names, list):
         if len(driver_names) == 0:
-            driver_display = "Unknown"
-        elif len(driver_names) == 1:
-            driver_display = driver_names[0]
+            driver_display = "Unknown (no match)"
         else:
-            driver_display = ", ".join(driver_names)  # e.g., "Alvin, Maria"
+            driver_display = ", ".join(driver_names)
     else:
         driver_display = str(driver_names)  # fallback if it's already a string
     
@@ -145,3 +175,27 @@ if driver_names is not None and results is not None and repair_instructions is n
     logger.info("\n🔹🔹🔹 END OF FINAL OUTPUT REPORT 🔹🔹🔹")
 else:
     logger.warning("❌❌❌ Incomplete data, final output report not generated")
+    # Show partial data for debugging
+    logger.info(f"  Driver data: {'available' if driver_names is not None else 'missing'}")
+    logger.info(f"  Diagnostics: {'available' if results is not None else 'missing'}")
+    logger.info(f"  Recommendations: {'available' if repair_instructions is not None else 'missing'}")
+
+# --- STAGE 5: Session Tracking & CSV Logging ---
+st_main = import_main(SESSION_TRACKER)
+if st_main:
+    logger.info("🔹 Logging session to diagnostics CSV...")
+    try:
+        # Pass all required data to session tracker
+        session_uuid = st_main(
+            start_time=qr_scan_timestamp,
+            finish_time=recommendation_timestamp,
+            plate_number=plate_number,
+            driver_names=driver_names,
+            diagnostics_ng=diagnostics_ng,
+            diagnostics_ok=diagnostics_ok
+        )
+        logger.info(f"✅ Session logged with UUID: {session_uuid}")
+    except Exception as e:
+        logger.error(f"Session tracking failed: {e}")
+else:
+    logger.warning("❌ Skipping session tracking: session_tracker module not available")
