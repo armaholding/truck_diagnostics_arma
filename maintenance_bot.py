@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 import logging
+from datetime import datetime
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -67,6 +68,7 @@ def generate_repair_instructions(diagnostics_ng):
         result = fix_response.choices[0].message.content.strip()
         logger.info("Successfully generated repair instructions.")
         return result
+    
     except Exception as e:
         error_msg = f"⚠️ Error generating fixes: {str(e)}"
         logger.error(f"LLM call failed for repair instructions: {e}")
@@ -113,13 +115,14 @@ def generate_maintenance_tips(diagnostics_ok):
         result = maintain_response.choices[0].message.content.strip()
         logger.info("Successfully generated maintenance tips.")
         return result
+    
     except Exception as e:
         error_msg = f"⚠️ Error generating maintenance tips: {str(e)}"
         logger.error(f"LLM call failed for maintenance tips: {e}")
         return error_msg
     
 # --- Main Orchestrator Function ---
-def main(diagnostics_ok, diagnostics_ng, model=MODEL):
+def main(diagnostics_ok, diagnostics_ng):
     """
     Generate repair instructions and maintenance tips.
     
@@ -134,20 +137,27 @@ def main(diagnostics_ok, diagnostics_ng, model=MODEL):
             "maintenance": str
         }
     """
+    # --- PRE-FLIGHT VALIDATION: API KEY CHECK WITH TIMESTAMP ON FAILURE ---
     logger.info("Starting main maintenance analysis...")
+
+    # ✅ RECORD TIMESTAMP HERE: Start of LLM operation (after validation)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   
+
     try:
         fixes = generate_repair_instructions(diagnostics_ng)
         maintenance = generate_maintenance_tips(diagnostics_ok)
+
         logger.info("Maintenance analysis completed successfully.")
-        return {
+        return timestamp, {
             "fixes": fixes,
             "maintenance": maintenance
         }
+    
     except Exception as e:
         logger.error(f"❌ Unexpected error in main maintenance analysis: {e}", exc_info=True)
-        return {
-            "fixes": "⚠️ Unable to generate repair instructions due to an internal error.",
-            "maintenance": "⚠️ Unable to generate maintenance tips due to an internal error."
+        return timestamp, {
+            "fixes": f"⚠️ Unable to generate repair instructions: {str(e)}",
+            "maintenance": f"⚠️ Unable to generate maintenance tips: {str(e)}"
         }
 
 # --- Main Execution ---
@@ -166,17 +176,23 @@ if __name__ == "__main__":
 
     print("🚛 Truck Maintenance Advisor (LLM-Powered)\n")
 
-    # Generate recommendations
-    recommendations = main(diagnostics_ok, diagnostics_ng)
+    # Generate recommendations with tuple unpacking
+    recommendation_timestamp, recommendations = main(diagnostics_ok, diagnostics_ng)
 
-    # Print Repair Fixes
-    print(f"\n🔧 {ORANGE}Recommended Fixes for Issues:{RESET}")
-    print("-" * 40)
-    print(recommendations["fixes"])
-    print("\n")
+    # ALWAYS display timestamp FIRST (consistent with other modules)
+    print(f"\n⏱️  Analysis performed at: {BLUE}{recommendation_timestamp}{RESET}\n")
 
-    # Print Maintenance Tips
-    print(f"\n✅ {CYAN}Maintenance Tips for Good Components:{RESET}")
-    print("-" * 40)
-    print(recommendations["maintenance"])
-    print("\n✨ Advice generated successfully.")
+    if recommendations is None:
+        print(f"{RED}❌ Maintenance analysis failed: API key missing or critical error{RESET}")
+    else:
+        # Print Repair Fixes
+        print(f"🔧 {ORANGE}Recommended Fixes for Issues:{RESET}")
+        print("-" * 40)
+        print(recommendations["fixes"])
+        print("\n")
+        
+        # Print Maintenance Tips
+        print(f"✅ {CYAN}Maintenance Tips for Good Components:{RESET}")
+        print("-" * 40)
+        print(recommendations["maintenance"])
+        print(f"\n{GREEN}✨ Advice generated successfully.{RESET}")
