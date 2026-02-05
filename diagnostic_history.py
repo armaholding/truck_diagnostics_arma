@@ -1,5 +1,5 @@
 # diagnostic_history.py
-"""Temporal consensus engine for truck component diagnostics with weighted scoring."""
+"""Temporal consensus engine for truck component diagnostics with yolo confidence tie breaker."""
 
 import logging
 from datetime import datetime
@@ -14,10 +14,6 @@ from config import (
 # Configure module-specific logger
 logger = logging.getLogger(__name__)
 
-# --- Weighted Scoring Configuration (Plate Number Consensus) ---
-YOLO_CONFIDENCE_WEIGHT = 0.60  # Prioritize clear plate visibility
-OCR_CONFIDENCE_WEIGHT = 0.40   # Secondary emphasis on OCR readability
-
 class DiagnosticHistory:
     """
     Track diagnostic history and compute temporal consensus decisions with ignore period.
@@ -26,7 +22,7 @@ class DiagnosticHistory:
     1. Majority vote on component states/plate numbers across time window
     2. Confidence-based tiebreaker for ambiguous cases
     
-    Maintains 18-second consensus window with 1-second ignore period to exclude unstable initial frames.
+    Maintains consensus window wit ignore period to exclude unstable initial frames.
     """
     
     def __init__(self, consensus_window_seconds=18, ignore_period_seconds=1):
@@ -70,7 +66,30 @@ class DiagnosticHistory:
             return list(BACK_EXPECTED_COMPONENTS)
         else:
             return list(EXPECTED_COMPONENT_COUNTS.keys())
+
+    def _get_display_name(self, component):
+        """
+        Convert internal component name to human-readable singular display name.
         
+        Args:
+            component (str): Internal component name (e.g., 'mirror', 'plate_number')
+        
+        Returns:
+            str: Singular human-readable display name (e.g., 'Mirror', 'Plate')
+        """
+        display_map = {
+            'mirror': 'Mirror',
+            'light_front': 'Front Light',
+            'wiper': 'Wiper',
+            'mirror_top': 'Top Mirror',
+            'plate_number': 'Plate',  # Singular for state consensus
+            'light_back': 'Back Light',
+            'stand': 'Stand',
+            'carrier': 'Carrier',
+            'lift': 'Lift'
+        }
+        return display_map.get(component, component.replace('_', ' ').title())
+     
     def _get_component_state(self, component, data):
         """
         Determine component state (✅/⚠️/❌) based on detection count and confidence thresholds.
@@ -103,22 +122,21 @@ class DiagnosticHistory:
             
     def _normalize_plate_number(self, plate_str):
         """
-        Normalize plate number string for consistent voting across OCR variations.
+        Normalize plate number PRESERVING Arabic characters (U+0600-U+06FF).
         
-        Applies conservative normalization:
-        - Removes all non-alphanumeric characters
-        - Converts to uppercase
-        - Returns None for invalid/empty inputs
+        Critical: Moroccan plates require Arabic character between digits (e.g., '8343ب1').
+        This function keeps digits + Arabic script ONLY - strips everything else.
         
         Args:
             plate_str (str | None): Raw plate number string from OCR
         
         Returns:
-            str | None: Normalized alphanumeric string or None if invalid
+            str | None: Normalized string with digits + Arabic characters, or None if invalid
         """
         if not plate_str or not isinstance(plate_str, str):
             return None
-        normalized = re.sub(r'[^A-Z0-9]', '', plate_str.upper())
+        # Keep ONLY digits (0-9) + Arabic script (U+0600-U+06FF)
+        normalized = re.sub(r'[^\d\u0600-\u06FF]', '', plate_str)
         return normalized if normalized else None
 
     def _resolve_consensus_two_stage(self, value_occurrences, value_confidences):
@@ -238,6 +256,12 @@ class DiagnosticHistory:
                 if ts >= cutoff_time
             ]
 
+    def _has_arabic(self, text):
+        """Check if text contains Arabic script characters (U+0600-U+06FF)."""
+        if not text or not isinstance(text, str):
+            return False
+        return bool(re.search(r'[\u0600-\u06FF]', text))
+
     def _get_best_detections_in_window(self, component, window_start, window_end):
         """
         Retrieve highest-confidence detections for component within specified time window.
@@ -355,127 +379,194 @@ class DiagnosticHistory:
         
         for component in expected_components:
             if component == "plate_number":
-                # --- PLATE NUMBER: Two-stage consensus using WEIGHTED COMBINED SCORE ---
-                plate_occurrences = {}          # {normalized_plate: count}
-                plate_yolo_confidences = {}     # {normalized_plate: [list of YOLO detection confidences]}
-                plate_ocr_confidences = {}      # {normalized_plate: [list of OCR confidences]}
-                plate_weighted_scores = {}      # {normalized_plate: [list of weighted combined scores]}
-                plate_raw_values = {}           # {normalized_plate: original_raw_string}
-                
+                # === LEVEL 1: Consensus on PLATE STATE (✅/⚠️/❌) ===
+                state_occurrences = {}      # {state: count}
+                state_yolo_confidences = {} # {state: [YOLO confidences]}
+
                 for ts, diag in usable_diagnostics:
                     comp_data = diag["truck_components"].get("plate_number", {})
+                    state = self._get_component_state("plate_number", comp_data)
+                    yolo_confs = comp_data.get("confidence", [])
+                    
+                    # Track state occurrences
+                    state_occurrences[state] = state_occurrences.get(state, 0) + 1
+                    
+                    # Track YOLO confidences for tiebreaking
+                    if state not in state_yolo_confidences:
+                        state_yolo_confidences[state] = []
+                    state_yolo_confidences[state].extend(yolo_confs)
+                
+                # Apply two-stage consensus on STATES
+                consensus_state = self._resolve_consensus_two_stage(
+                    state_occurrences,
+                    state_yolo_confidences  # YOLO confidence ONLY for tiebreaking
+                )
+
+                # --- Plate STATE consensus ---
+                display_name = self._get_display_name("plate_number")
+                total_usable_frames = len(usable_diagnostics)
+                
+                logger.info(f"{display_name} STATE consensus analysis (window: {total_usable_frames} frames, two-stage voting):")
+
+                # Log candidates sorted by occurrence (descending), then by state for deterministic order
+                sorted_states = sorted(
+                    [(state, count) for state, count in state_occurrences.items() if count > 0],
+                    key=lambda x: (-x[1], x[0])
+                )
+                for state, count in sorted_states:
+                    confs = state_yolo_confidences.get(state, [])
+                    avg_yolo = sum(confs) / len(confs) if confs else 0.0
+                    logger.info(f"{display_name} STATE candidate '{state}': occurrences={count}, avg_yolo={avg_yolo:.2f}")
+                
+                winner_confs = state_yolo_confidences.get(consensus_state, [])
+                winner_avg_yolo = sum(winner_confs) / len(winner_confs) if winner_confs else 0.0
+                logger.info(f"{display_name} STATE consensus winner: '{consensus_state}' (occurrences={state_occurrences.get(consensus_state, 0)}, avg_yolo={winner_avg_yolo:.2f})")
+                logger.info("")  # Blank line separator
+    
+                # === EARLY EXIT: Skip number consensus if state ≠ ✅ ===
+                if consensus_state != "✅":
+                    # Build component with consensus state but NO number
+                    consensus_components["plate_number"] = {
+                        "count": 0,
+                        "confidence": [],
+                        "consensus_state": consensus_state
+                    }
+                    consensus_diagnostics.append(self._build_consensus_message("plate_number", consensus_state))
+                    continue  # Skip to next component
+
+                # === LEVEL 2: Consensus on PLATE NUMBER (ONLY from ✅ frames) ===
+                plate_occurrences = {}          # {normalized_plate: count}
+                plate_yolo_confidences = {}     # {normalized_plate: [list of YOLO detection confidences]}
+                plate_raw_values = {}           # {normalized_plate: original_raw_string}
+                
+                # CRITICAL: ONLY process frames where plate state = ✅
+                valid_frame_count = 0
+                for ts, diag in usable_diagnostics:
+                    comp_data = diag["truck_components"].get("plate_number", {})
+                    state = self._get_component_state("plate_number", comp_data)
+        
+                    # FILTER: Skip non-✅ states (this is the missing constraint!)
+                    if state != "✅":
+                        continue
+                    
+                    valid_frame_count += 1
                     plate_num = comp_data.get("number")
                     yolo_confs = comp_data.get("confidence", [])
-                    ocr_conf = comp_data.get("ocr_confidence", 0.0)
 
                     if plate_num:
                         normalized = self._normalize_plate_number(plate_num)
                         if normalized:
-                            # Track occurrences
+                            # Track occurrences (Stage 1)
                             plate_occurrences[normalized] = plate_occurrences.get(normalized, 0) + 1
                             
-                            # Track YOLO detection confidences for final output
+                            # Track YOLO confidences for tiebreaking (Stage 2) and output
                             if normalized not in plate_yolo_confidences:
                                 plate_yolo_confidences[normalized] = []
                             if yolo_confs:
                                 plate_yolo_confidences[normalized].extend(yolo_confs)
-                            
-                            # Track OCR confidences
-                            if normalized not in plate_ocr_confidences:
-                                plate_ocr_confidences[normalized] = []
-                            plate_ocr_confidences[normalized].append(ocr_conf)
-
-                            # Track WEIGHTED SCORE for tiebreaking (0.60*YOLO + 0.40*OCR)
-                            if normalized not in plate_weighted_scores:
-                                plate_weighted_scores[normalized] = []
-                            yolo_conf_for_combined = yolo_confs[0] if yolo_confs else 0.0
-                            weighted_score = (YOLO_CONFIDENCE_WEIGHT * yolo_conf_for_combined) + (OCR_CONFIDENCE_WEIGHT * ocr_conf)
-                            plate_weighted_scores[normalized].append(weighted_score)
 
                             # Preserve one raw value for output
                             if normalized not in plate_raw_values:
                                 plate_raw_values[normalized] = plate_num
 
-                # Log all candidate plates with their metrics BEFORE consensus decision
-                logger.info(f"Plate consensus analysis (window: {len(usable_diagnostics)} frames, weights: YOLO={YOLO_CONFIDENCE_WEIGHT:.0%}, OCR={OCR_CONFIDENCE_WEIGHT:.0%}):")
-                if plate_occurrences:
-                    for candidate, count in sorted(plate_occurrences.items(), key=lambda x: x[1], reverse=True):
-                        weighted_list = plate_weighted_scores.get(candidate, [])
-                        yolo_list = plate_yolo_confidences.get(candidate, [])
-                        ocr_list = plate_ocr_confidences.get(candidate, [])
-                        avg_weighted = sum(weighted_list) / len(weighted_list) if weighted_list else 0.0
-                        avg_yolo = sum(yolo_list) / len(yolo_list) if yolo_list else 0.0
-                        avg_ocr = sum(ocr_list) / len(ocr_list) if ocr_list else 0.0
-                        logger.info(f"  Candidate '{candidate}': occurrences={count}, "
-                                f"avg_weighted={avg_weighted:.2f} "
-                                f"(YOLO={avg_yolo:.2f}*{YOLO_CONFIDENCE_WEIGHT:.0%} + OCR={avg_ocr:.2f}*{OCR_CONFIDENCE_WEIGHT:.0%})")
-                else:
-                    logger.info("  No plate candidates detected in consensus window")
-
-                # Apply two-stage consensus to select best plate number
+                # --- ENHANCED LOGGING: Plate NUMBER consensus ---
+                logger.info(f"Plate NUMBER consensus analysis (window: {valid_frame_count} frames, two-stage voting):")
+                
+                # Log candidates sorted by occurrence (descending), then by plate string
+                sorted_plates = sorted(
+                    [(plate, count) for plate, count in plate_occurrences.items() if count > 0],
+                    key=lambda x: (-x[1], x[0])
+                )
+                for plate, count in sorted_plates:
+                    confs = plate_yolo_confidences.get(plate, [])
+                    avg_yolo = sum(confs) / len(confs) if confs else 0.0
+                    logger.info(f"Plate NUMBER candidate '{plate}': occurrences={count}, avg_yolo={avg_yolo:.2f}")
+                
+                # Apply two-stage consensus on PLATE NUMBERS (occurrences → YOLO confidence)
                 best_normalized_plate = self._resolve_consensus_two_stage(
-                    plate_occurrences, 
-                    plate_weighted_scores  # CRITICAL: Use weighted scores for tiebreaking
+                    plate_occurrences,
+                    plate_yolo_confidences  # YOLO confidence ONLY (NO OCR)
                 )
 
                 if best_normalized_plate:
-                    # Log winner selection details
-                    winner_weighted = plate_weighted_scores[best_normalized_plate]
-                    avg_weighted_winner = sum(winner_weighted) / len(winner_weighted) if winner_weighted else 0.0
-                    winner_yolo = plate_yolo_confidences.get(best_normalized_plate, [0.0])
-                    avg_yolo_winner = sum(winner_yolo) / len(winner_yolo) if winner_yolo else 0.0
-                    winner_ocr = plate_ocr_confidences.get(best_normalized_plate, [0.0])
-                    avg_ocr_winner = sum(winner_ocr) / len(winner_ocr) if winner_ocr else 0.0
+                    # Log winner selection details (occurrences + YOLO confidence)
+                    winner_occurrences = plate_occurrences[best_normalized_plate]
+                    winner_yolo = plate_yolo_confidences.get(best_normalized_plate, [0.95])
+                    avg_yolo_winner = sum(winner_yolo) / len(winner_yolo) if winner_yolo else 0.95
                     
-                    logger.info(f"Plate consensus winner: '{best_normalized_plate}' "
-                            f"(occurrences={plate_occurrences[best_normalized_plate]}, "
-                            f"avg_weighted={avg_weighted_winner:.2f})")
+                    logger.info(f"Plate NUMBER consensus winner: '{best_normalized_plate}' (occurrences={winner_occurrences}, avg_yolo={avg_yolo_winner:.2f})")
+                    logger.info("")  # Blank line separator
         
-                    # Build consensus component with semantic field preservation
+                    # Build consensus component with number
                     consensus_components["plate_number"] = {
                         "count": 1,
-                        "confidence": [round(avg_yolo_winner, 2)],  # Pure YOLO detection confidence
-                        "ocr_confidence": round(avg_ocr_winner, 2),  # Pure OCR readability
+                        "confidence": [round(avg_yolo_winner, 2)],
                         "consensus_state": "✅",
-                        "number": plate_raw_values[best_normalized_plate]  # Original formatting
+                        "number": plate_raw_values[best_normalized_plate]
                     }
-                    consensus_diagnostics.append(f"✅ plate number: {plate_raw_values[best_normalized_plate]} (combined: {avg_weighted_winner:.2f})")
+                    consensus_diagnostics.append(
+                        f"✅ plate number: visible, with number: {plate_raw_values[best_normalized_plate]}"
+                    )
                 else:
-                    # No valid plate numbers in window
+                    # Edge case: state=✅ but no valid numbers extracted
+                    logger.info("Plate NUMBER consensus winner: None (no valid plate numbers in ✅ frames)")
+                    logger.info("")  # Blank line separator
+                    
                     consensus_components["plate_number"] = {
                         "count": 0,
                         "confidence": [],
-                        "consensus_state": "❌"
+                        "consensus_state": "⚠️"
                     }
-                    consensus_diagnostics.append(f"❌ plate number: missing or obscured")
+                    consensus_diagnostics.append("⚠️ plate number: visible but could not be read")
 
             else:
                 # --- REGULAR COMPONENTS: Two-stage consensus on states (✅/⚠️/❌) ---
                 state_occurrences = {}      # {state: count}
-                state_quality_scores = {}   # {state: [list of detection confidences]}
+                state_yolo_confidences = {}   # {state: [list of detection confidences]}
                 
                 for ts, diag in usable_diagnostics:
                     comp_data = diag["truck_components"].get(component, {})
                     state = self._get_component_state(component, comp_data)
-                    confs = comp_data.get("confidence", [])
+                    yolo_confs = comp_data.get("confidence", [])
                     
                     # Track state occurrences
                     state_occurrences[state] = state_occurrences.get(state, 0) + 1
                     
                     # Track confidences for tiebreaker
-                    if state not in state_quality_scores:
-                        state_quality_scores[state] = []
-                    state_quality_scores[state].extend(confs)
+                    if state not in state_yolo_confidences:
+                        state_yolo_confidences[state] = []
+                    state_yolo_confidences[state].extend(yolo_confs)
 
                 # Apply two-stage consensus to select best state
                 consensus_state = self._resolve_consensus_two_stage(
                     state_occurrences, 
-                    state_quality_scores
+                    state_yolo_confidences
                 )
                 
                 if consensus_state is None:
                     consensus_state = "❓"
+
+                # --- ENHANCED LOGGING: Component STATE consensus ---
+                display_name = self._get_display_name(component)
+                total_usable_frames = len(usable_diagnostics)
                 
+                logger.info(f"{display_name} STATE consensus analysis (window: {total_usable_frames} frames, two-stage voting):")
+                
+                # Log candidates sorted by occurrence (descending), then by state
+                sorted_states = sorted(
+                    [(state, count) for state, count in state_occurrences.items() if count > 0],
+                    key=lambda x: (-x[1], x[0])
+                )
+                for state, count in sorted_states:
+                    confs = state_yolo_confidences.get(state, [])
+                    avg_yolo = sum(confs) / len(confs) if confs else 0.0
+                    logger.info(f"{display_name} STATE candidate '{state}': occurrences={count}, avg_yolo={avg_yolo:.2f}")
+                
+                winner_confs = state_yolo_confidences.get(consensus_state, [])
+                winner_avg_yolo = sum(winner_confs) / len(winner_confs) if winner_confs else 0.0
+                logger.info(f"{display_name} STATE consensus winner: '{consensus_state}' (occurrences={state_occurrences.get(consensus_state, 0)}, avg_yolo={winner_avg_yolo:.2f})")
+                logger.info("")  # Blank line separator
+
                 # Build component data based on consensus state
                 if consensus_state == "✅":
                     # For ✅ state: use highest-confidence detections from frames that produced ✅ state
