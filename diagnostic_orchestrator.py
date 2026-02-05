@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 QR_CODE_SCANNER = "qr_code_scanner_rt"
 TRUCK_DIAGNOSER = "yolo_truck_rt"
 AI_RECOMMENDER = "maintenance_bot"
-SESSION_TRACKER = "session_tracker"
+STATUS_TRACKER = "status_tracker"
+STATUS_ANALYZER = "status_analyzer"
 RATE_LIMIT_DELAY = 1.0  # seconds between stages to avoid overload
 
 BLUE = "\033[94m"
@@ -33,11 +34,12 @@ def import_main(module_name: str) -> Optional[Callable[..., Any]]:
     return None
 
 # === EXECUTE QUERY PIPELINE (CORE FUNCTIONALITY) ===
-# --- CRITICAL FIX: Initialize ALL timestamps upfront ---
-current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-qr_scan_timestamp = current_time_str
-diagnosis_timestamp = current_time_str
-recommendation_timestamp = current_time_str
+# --- Initialize ALL timestamps upfront ---
+qr_scan_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+diagnosis_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+recommendation_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+tracking_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+analysis_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # --- STAGE 1: QR code scanner ---
 driver_names = None
@@ -46,7 +48,7 @@ qs_main = import_main(QR_CODE_SCANNER)
 if qs_main:
     logger.info("🔹 Running qr_code_scanner to find relevant video...")
     try:
-        qr_scan_timestamp, driver_names = qs_main()  # CRITICAL: Wrapped in try/except
+        qr_scan_timestamp, driver_names = qs_main()
     except Exception as e:
         logger.error(f"QR scanner execution failed: {e}")
         driver_names = None
@@ -181,12 +183,12 @@ else:
     logger.info(f"  Recommendations: {'available' if repair_instructions is not None else 'missing'}")
 
 # --- STAGE 5: Session Tracking & CSV Logging ---
-st_main = import_main(SESSION_TRACKER)
+st_main = import_main(STATUS_TRACKER)
 if st_main:
     logger.info("🔹 Logging session to diagnostics CSV...")
     try:
         # Pass all required data to session tracker
-        session_uuid = st_main(
+        tracking_timestamp, session_uuid = st_main(
             start_time=qr_scan_timestamp,
             finish_time=recommendation_timestamp,
             plate_number=plate_number,
@@ -194,8 +196,25 @@ if st_main:
             diagnostics_ng=diagnostics_ng,
             diagnostics_ok=diagnostics_ok
         )
-        logger.info(f"✅ Session logged with UUID: {session_uuid}")
+        logger.info(f"✅ Session logged with UUID: {session_uuid} at {tracking_timestamp}")
     except Exception as e:
         logger.error(f"Session tracking failed: {e}")
 else:
-    logger.warning("❌ Skipping session tracking: session_tracker module not available")
+    logger.warning("❌ Skipping session tracking: status_tracker module not available")
+
+# --- STAGE 6: Truck Status Analysis ---
+
+user_input = input("Do you want to proceed with the truck status analysis? Press Enter to proceed, or 'n' to exit: ")
+if user_input == '':
+    sa_main = import_main(STATUS_ANALYZER)
+    if sa_main:
+        logger.info("🔹 Running status analyzer to compare going/coming sessions...")
+        try:
+            analysis_timestamp, files_processed = sa_main()
+            logger.info(f"✅ Status analysis completed at {analysis_timestamp}: {files_processed} file(s) with new pairs")
+        except Exception as e:
+            logger.error(f"Status analysis execution failed: {e}")
+    else:
+        logger.warning("❌ Skipping status analysis: status_analyzer module not available")
+else:
+    print("Exiting without truck status analysis")
