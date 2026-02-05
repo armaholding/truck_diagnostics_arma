@@ -1,11 +1,10 @@
 import cv2
 from ultralytics import YOLO
 import os
+import torch
 import json
-import easyocr
 import logging
 from datetime import datetime
-import torch
 import re
 from config import OCR_LANGUAGES, EXPECTED_COMPONENT_COUNTS, FRONT_EXPECTED_COMPONENTS, BACK_EXPECTED_COMPONENTS
 from diagnostic_history import DiagnosticHistory
@@ -29,8 +28,6 @@ DIAGNOSTICS_PATH = "diagnostics"
 SAVE_INTERMEDIATE_DIAGNOSTICS = True  # Set to True to save diagnostics for each frame in video mode
 SAVE_CROPS = True  # Set to True to save cropped bounding boxes for validation
 CROPPED_PARTS_PATH = "cropped_parts"
-YOLO_CONFIDENCE_WEIGHT = 0.60  # Weight for YOLO detection confidence in plate consensus
-OCR_CONFIDENCE_WEIGHT = 0.40   # Weight for OCR readability confidence in plate consensus
 
 # --- Input & Tracking Configuration ---
 INPUT_MODE = "video"  # Options: "image", "camera", "video"
@@ -46,9 +43,6 @@ ORANGE = "\033[38;5;208m"
 GREEN = "\033[92m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
-
-# Initialize EasyOCR reader
-reader = easyocr.Reader(OCR_LANGUAGES, verbose=False)
 
 # --- GPU/CPU Detection ---
 def get_device():
@@ -330,15 +324,14 @@ def process_diagnostics_and_save(
     # Run diagnostics based on truck face
     diagnostics_log = []
     plate_num = None
-    plate_ocr_conf = 0.0
 
     if truck_face == "truck_back":
         logger.info("Running back diagnostics")
-        diag_messages, plate_num, plate_ocr_conf = run_back_diagnostics(components, plate_crop, reader)  # REVISED
+        diag_messages, plate_num = run_back_diagnostics(components, plate_crop)
         diagnostics_log = diag_messages
     elif truck_face == "truck_front":
         logger.info("Running front diagnostics")
-        diag_messages, plate_num, plate_ocr_conf = run_front_diagnostics(components, plate_crop, reader)  # REVISED
+        diag_messages, plate_num = run_front_diagnostics(components, plate_crop)
         diagnostics_log = diag_messages
     else:
         msg = "truck face not detected — no diagnostics performed"
@@ -352,12 +345,9 @@ def process_diagnostics_and_save(
         yolo_confs = plate_entry.get('confidences', [])
         if yolo_confs:
             yolo_conf = yolo_confs[0]  # Expected count = 1 for plate_number
-            combined_score = (YOLO_CONFIDENCE_WEIGHT * yolo_conf) + (OCR_CONFIDENCE_WEIGHT * plate_ocr_conf)
-            logger.info(f"Plate '{plate_num}': YOLO={yolo_conf:.2f} ({int(YOLO_CONFIDENCE_WEIGHT*100)}%), "
-                    f"OCR={plate_ocr_conf:.2f} ({int(OCR_CONFIDENCE_WEIGHT*100)}%), "
-                    f"combined={combined_score:.2f}")
+            logger.info(f"Plate '{plate_num}' detected with YOLO confidence {yolo_conf:.2f}")
         else:
-            logger.info(f"Plate '{plate_num}': OCR={plate_ocr_conf:.2f} (YOLO confidence unavailable)")
+            logger.info(f"Plate '{plate_num}' detected (YOLO confidence unavailable)")
 
     # Print diagnostics to console
     for msg in diagnostics_log:
@@ -384,7 +374,6 @@ def process_diagnostics_and_save(
         # Store OCR confidence separately for plate_number
         if comp == 'plate_number' and plate_num is not None:
             comp_entry["number"] = plate_num
-            comp_entry["ocr_confidence"] = round(plate_ocr_conf, 2)
         
         enhanced_components[comp] = comp_entry
 
@@ -448,23 +437,13 @@ def save_final_consensus_diagnostics(
     # Clean plate number for filename with multi-stage fallback
     plate_clean = ""
     if plate_number and isinstance(plate_number, str) and plate_number.strip():
-        # Stage 1: Try ASCII alphanumeric extraction (standard case)
-        plate_clean = re.sub(r'[^A-Z0-9]', '', plate_number.upper())
-        
-        # Stage 2: If empty after Stage 1, try Unicode digit extraction (handles full-width/zero-width artifacts)
+        # Stage 1: Preserve digits + Arabic characters for Moroccan plates
+        plate_clean = re.sub(r'[^\d\u0600-\u06FF]', '', plate_number)
+        # Stage 2: Fallback to ASCII if no Arabic/digits found
         if not plate_clean:
-            # Extract ANY digit characters (Unicode-aware via str.isdigit())
-            digits = ''.join(ch for ch in plate_number if ch.isdigit())
-            if digits:
-                plate_clean = digits[:8]  # Limit to 8 digits for filename safety
-            else:
-                # Stage 3: Fallback to first 8 alphanumeric characters (any script)
-                alnum_chars = [ch for ch in plate_number if ch.isalnum()]
-                if alnum_chars:
-                    plate_clean = ''.join(alnum_chars[:8]).upper()
-    
-    # Final fallback if all cleaning stages failed
-    if not plate_clean:
+            plate_clean = re.sub(r'[^A-Z0-9]', '', plate_number.upper())
+        plate_clean = plate_clean[:12] or "UNKNOWN"
+    else:
         plate_clean = "UNKNOWN"
 
     # Generate filename: final_20260127_143522_ABC123.json
