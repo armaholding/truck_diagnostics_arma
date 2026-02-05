@@ -141,21 +141,21 @@ def main(diagnostics_ok, diagnostics_ng):
     logger.info("Starting main maintenance analysis...")
 
     # ✅ RECORD TIMESTAMP HERE: Start of LLM operation (after validation)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   
+    recommendation_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   
 
     try:
         fixes = generate_repair_instructions(diagnostics_ng)
         maintenance = generate_maintenance_tips(diagnostics_ok)
 
         logger.info("Maintenance analysis completed successfully.")
-        return timestamp, {
+        return recommendation_timestamp, {
             "fixes": fixes,
             "maintenance": maintenance
         }
     
     except Exception as e:
         logger.error(f"❌ Unexpected error in main maintenance analysis: {e}", exc_info=True)
-        return timestamp, {
+        return recommendation_timestamp, {
             "fixes": f"⚠️ Unable to generate repair instructions: {str(e)}",
             "maintenance": f"⚠️ Unable to generate maintenance tips: {str(e)}"
         }
