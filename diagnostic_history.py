@@ -4,12 +4,7 @@
 import logging
 from datetime import datetime
 import re
-from config import (
-    DIAGNOSTIC_THRESHOLD,
-    EXPECTED_COMPONENT_COUNTS,
-    FRONT_EXPECTED_COMPONENTS,
-    BACK_EXPECTED_COMPONENTS
-)
+from config import DIAGNOSTIC_THRESHOLD, EXPECTED_COMPONENT_COUNTS, FRONT_EXPECTED_COMPONENTS, BACK_EXPECTED_COMPONENTS
 
 # Configure module-specific logger
 logger = logging.getLogger(__name__)

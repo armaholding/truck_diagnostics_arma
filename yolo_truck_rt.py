@@ -1,12 +1,18 @@
 import cv2
-from ultralytics import YOLO
 import os
-import torch
 import json
 import logging
 from datetime import datetime
 import re
-from config import OCR_LANGUAGES, EXPECTED_COMPONENT_COUNTS, FRONT_EXPECTED_COMPONENTS, BACK_EXPECTED_COMPONENTS
+from config import (TEST_IMAGE_PATH, OUTPUT_IMAGE_PATH, TEST_VIDEO_PATH, OUTPUT_VIDEO_PATH, DIAGNOSTICS_PATH,
+                    INPUT_MODE, EXPECTED_COMPONENT_COUNTS, FRONT_EXPECTED_COMPONENTS, BACK_EXPECTED_COMPONENTS,
+                    TRACKER_TYPE, CAMERA_INDEX, CONSENSUS_WINDOW_SECONDS, IGNORE_PERIOD_SECONDS, SAVE_INTERVAL_SECONDS,
+                    SAVE_INTERMEDIATE_DIAGNOSTICS, DELETE_INT_DIAGNOSTICS, SAVE_CROPS, DELETE_SAVED_CROPS,
+                    BLUE, RED, ORANGE, GREEN, CYAN, RESET)
+from utility import (
+    get_cached_yolo_model, get_available_classes, _extract_monthly_folder,
+    save_cropped_detections, cleanup_intermediate_diagnostics, cleanup_saved_crops
+)
 from diagnostic_history import DiagnosticHistory
 from parts_diagnostics import run_front_diagnostics, run_back_diagnostics
 
@@ -16,82 +22,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# --- Configuration ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-YOLO_MODEL_PATH = 'truck7.pt'  # Path to the YOLO model
-IMAGE_PATH = os.path.join(BASE_DIR, 'truck_test', 'truckb4.jpg')  # Default test image
-OUTPUT_IMAGE_PATH = "annotated_image.jpg"
-VIDEO_FILE_PATH = os.path.join(BASE_DIR, 'truck_test', 'test_video.mp4') # Default test video
-VIDEO_OUTPUT_PATH = "output_video.mp4"
-DIAGNOSTICS_PATH = "diagnostics"
-SAVE_INTERMEDIATE_DIAGNOSTICS = True  # Set to True to save diagnostics for each frame in video mode
-SAVE_CROPS = True  # Set to True to save cropped bounding boxes for validation
-CROPPED_PARTS_PATH = "cropped_parts"
-
-# --- Input & Tracking Configuration ---
-INPUT_MODE = "video"  # Options: "image", "camera", "video"
-CAMERA_INDEX = 0
-CONSENSUS_WINDOW_SECONDS = 18
-IGNORE_PERIOD_SECONDS = 1
-SAVE_INTERVAL_SECONDS = 2.5
-TRACKER_TYPE = "botsort.yaml"  # or "bytetrack.yaml"
-
-BLUE = "\033[94m"
-RED = "\033[91m"
-ORANGE = "\033[38;5;208m"
-GREEN = "\033[92m"
-CYAN = "\033[96m"
-RESET = "\033[0m"
-
-# --- GPU/CPU Detection ---
-def get_device():
-    """
-    Automatically select GPU if available, otherwise fall back to CPU.
-    
-    Returns:
-        str: Device identifier ('cuda' if GPU available, 'cpu' otherwise)
-    """
-    if torch.cuda.is_available():
-        device = 'cuda'
-        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        device = 'cpu'
-        logger.info("Using CPU (no GPU detected)")
-    return device
-
-# --- YOLO Model Caching Function ---
-_yolo_model = None
-_yolo_device = None
-
-def get_cached_yolo_model():
-    """
-    Get cached YOLO model instance to avoid reloading between frames.
-    
-    Returns:
-        tuple: (model, device)
-            - model: Cached YOLO model instance
-            - device: Device where model is loaded ('cuda' or 'cpu')
-    """
-    global _yolo_model, _yolo_device
-    if _yolo_model is None:
-        _yolo_device = get_device()
-        _yolo_model = YOLO(YOLO_MODEL_PATH).to(_yolo_device)
-        logger.info(f"YOLO model cached on {_yolo_device} - will reuse for all frames")
-    return _yolo_model, _yolo_device
-
-# --- Object Detection Helper Functions ---
-def get_available_classes(model):
-    """
-    Retrieve the list of available classes from the YOLO model.
-    
-    Args:
-        model: YOLO model instance
-    
-    Returns:
-        dict: Dictionary mapping class indices to class names
-    """
-    return model.names
 
 # --- Cropping and Saving Functions ---
 def extract_plate_crop(source_img, full_component_data, truck_face):
@@ -120,55 +50,6 @@ def extract_plate_crop(source_img, full_component_data, truck_face):
             else:
                 logger.warning("Invalid plate crop coordinates")
     return plate_crop
-
-# --- Cropping and Saving Functions ---
-def save_cropped_detections(image, component_data, frame_id=None):
-    """
-    Save cropped regions of all detected objects for validation and debugging.
-    
-    Args:
-        image: Source image/frame as NumPy array
-        component_data: Detection data dictionary grouped by component type
-        frame_id (int | None): Frame number for filename (None for single images)
-    
-    Returns:
-        None: Saves cropped images to CROPPED_PARTS_PATH directory
-    """
-    if image is None:
-        logger.warning("Could not load image/frame for cropping")
-        return
-        
-    # Create output directory if it doesn't exist
-    os.makedirs(CROPPED_PARTS_PATH, exist_ok=True)
-
-    h, w = image.shape[:2]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    crop_index = 0
-
-    for class_name, data in component_data.items():
-        for i, (conf, bbox) in enumerate(zip(data['confidences'], data['boxes'])):
-            x1, y1, x2, y2 = [float(coord) for coord in bbox]
-            # Clamp coordinates to image boundaries
-            x1, y1 = max(0, int(x1)), max(0, int(y1))
-            x2, y2 = min(w, int(x2)), min(h, int(y2))
-            
-            # Skip invalid crops
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            crop = image[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-
-            # Format: {timestamp}[_frame{frame_id}]_{class}_{confidence:.2f}_{index}.jpg
-            if frame_id is not None:
-                filename = f"{timestamp}_frame{frame_id}_{class_name}_{conf:.2f}_{crop_index}.jpg"
-            else:
-                filename = f"{timestamp}_{class_name}_{conf:.2f}_{crop_index}.jpg"
-                
-            filepath = os.path.join(CROPPED_PARTS_PATH, filename)
-            cv2.imwrite(filepath, crop)
-            crop_index += 1
 
 # --- Core Detection and Tracking Function ---
 def detect_or_track_objects(source, is_video=False, frame_id=0):
@@ -292,6 +173,7 @@ def detect_or_track_objects(source, is_video=False, frame_id=0):
 
     return json_output, annotated_image, component_data
 
+
 # --- Diagnostic Processing and Saving ---
 def process_diagnostics_and_save(
     truck_face, 
@@ -301,7 +183,9 @@ def process_diagnostics_and_save(
     source_info,
     is_video=False,
     frame_id=0,
-    save_to_disk=True
+    save_to_disk=True,
+    diagnosis_timestamp: str = None,
+    session_folder_name: str = None
 ):
     """
     Process diagnostics and save results for both image and video modes.
@@ -315,7 +199,9 @@ def process_diagnostics_and_save(
         is_video: Boolean indicating if processing video frame
         frame_id: Frame number (for video mode)
         save_to_disk (bool): If False, processes diagnostics but skips disk write (for intermediate frames)
-        
+        diagnosis_timestamp (str): Session start timestamp in "YYYY-MM-DD HH:MM:SS" format
+        session_folder_name (str): Session folder name like "int_diagnostics_20260206_143522_123"
+
     Returns:
         tuple: (diagnostics_log, enhanced_components)
             - diagnostics_log: List of diagnostic messages with status emojis
@@ -339,7 +225,7 @@ def process_diagnostics_and_save(
         logger.warning(msg)
         diagnostics_log = [msg]
 
-    # --- LOG WEIGHTED COMBINED SCORE (YOLO*0.60 + OCR*0.40) FOR PLATE ---
+    # --- LOG YOLO SCORE FOR PLATE ---
     if plate_num and truck_face in ("truck_front", "truck_back") and 'plate_number' in full_component_data:
         plate_entry = full_component_data['plate_number']
         yolo_confs = plate_entry.get('confidences', [])
@@ -380,12 +266,28 @@ def process_diagnostics_and_save(
     # ONLY save diagnostics to JSON file if explicitly requested
     if save_to_disk:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs(DIAGNOSTICS_PATH, exist_ok=True)
+        os.makedirs(DIAGNOSTICS_PATH, exist_ok=True) # Base directory always exists
 
-        if is_video:
-            diag_output_path = os.path.join(DIAGNOSTICS_PATH, f"diagnostics_{timestamp}_frame{frame_id}.json")
+        # Determine output directory based on session context
+        if diagnosis_timestamp and session_folder_name:
+            # NEW HIERARCHY: diagnostics/YYYYMM/int_diagnostics_.../
+            monthly_folder = _extract_monthly_folder(diagnosis_timestamp)
+            output_dir = os.path.join(DIAGNOSTICS_PATH, monthly_folder, session_folder_name)
         else:
-            diag_output_path = os.path.join(DIAGNOSTICS_PATH, f"diagnostics_{timestamp}.json")
+            # FALLBACK: Flat structure (backward compatibility)
+            output_dir = DIAGNOSTICS_PATH
+            logger.debug("Using flat diagnostics directory (no session context provided)")
+        
+        # Create nested directories
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Build filename
+        if is_video:
+            filename = f"diagnostics_{timestamp}_frame{frame_id}.json"
+        else:
+            filename = f"diagnostics_{timestamp}.json"
+        
+        diag_output_path = os.path.join(output_dir, filename)
 
         with open(diag_output_path, 'w', encoding='utf-8') as f:
             json.dump({
@@ -442,13 +344,19 @@ def save_final_consensus_diagnostics(
         # Stage 2: Fallback to ASCII if no Arabic/digits found
         if not plate_clean:
             plate_clean = re.sub(r'[^A-Z0-9]', '', plate_number.upper())
+        # Stage 3: Truncate to 12 chars max, fallback to "UNKNOWN"
         plate_clean = plate_clean[:12] or "UNKNOWN"
     else:
         plate_clean = "UNKNOWN"
 
     # Generate filename: final_20260127_143522_ABC123.json
     filename = f"final_{date_str}_{time_str}_{plate_clean}.json"
-    diag_output_path = os.path.join(DIAGNOSTICS_PATH, filename)
+    monthly_folder = _extract_monthly_folder(diagnosis_timestamp)
+    output_dir = os.path.join(DIAGNOSTICS_PATH, monthly_folder)
+    diag_output_path = os.path.join(output_dir, filename)
+    
+    # Create directory before saving
+    os.makedirs(output_dir, exist_ok=True)
     
     # Build final diagnostic structure with consensus metadata
     final_diagnostics = {
@@ -470,14 +378,21 @@ def save_final_consensus_diagnostics(
     logger.info(f"✅ FINAL CONSENSUS DIAGNOSTICS SAVED: {filename}")
     return diag_output_path
 
-def process_single_image(image_path: str, diagnosis_timestamp: str) -> dict | None:
+def process_single_image(
+    image_path: str, 
+    diagnosis_timestamp: str,
+    session_folder_name: str,
+    parts_session_folder: str
+) -> dict | None:
     """
     Complete diagnostic pipeline for a single image from detection to final report.
     
     Args:
         image_path: Path to input image file
         diagnosis_timestamp: ISO 8601 timestamp when diagnostic operation started
-    
+        session_folder_name: Session folder name like "int_diagnostics_20260206_143522_123"
+        parts_session_folder: Parts session folder name like "parts_20260206_143522_123"
+
     Returns:
         dict | None: Result dictionary with diagnostics or None on failure
             - truck_face: Detected truck face ("truck_front" or "truck_back")
@@ -514,13 +429,20 @@ def process_single_image(image_path: str, diagnosis_timestamp: str) -> dict | No
         plate_crop,
         source_info,
         is_video=False,
-        save_to_disk=True
+        save_to_disk=True,
+        diagnosis_timestamp=diagnosis_timestamp,
+        session_folder_name=session_folder_name
     )
 
     # Optional cropped detections
     if SAVE_CROPS:
         logger.info("Saving cropped detections to 'cropped_parts/' directory")
-        save_cropped_detections(source_img, full_component_data)
+        save_cropped_detections(
+            source_img, 
+            full_component_data,
+            diagnosis_timestamp=diagnosis_timestamp,
+            parts_session_folder=parts_session_folder
+        )
     
     # Display image if not headless
     if annotated_image is not None:
@@ -561,7 +483,10 @@ def process_video_source(
     camera_index: int = 0,
     consensus_window: int = CONSENSUS_WINDOW_SECONDS,
     ignore_period: int = IGNORE_PERIOD_SECONDS,
-    save_interval: float = SAVE_INTERVAL_SECONDS
+    save_interval: float = SAVE_INTERVAL_SECONDS,
+    session_folder_name: str = None,
+    diagnosis_timestamp: str = None,
+    parts_session_folder: str = None
 ) -> tuple:
     """
     Process video file or camera stream with temporal consensus tracking over multiple frames.
@@ -573,7 +498,10 @@ def process_video_source(
         consensus_window: Duration in seconds for temporal consensus window (default: 18)
         ignore_period: Duration in seconds to ignore at start of stream for stabilization (default: 1)
         save_interval: Interval in seconds between diagnostic saves during processing (default: 2.5)
-    
+        session_folder_name: Session folder name like "int_diagnostics_20260206_143522_123"
+        diagnosis_timestamp: Session start timestamp in "YYYY-MM-DD HH:MM:SS" format
+        parts_session_folder: Parts session folder name like "parts_20260206_143522_123"
+
     Returns:
         tuple: (consensus_result, success)
             - consensus_result: Tuple from DiagnosticHistory.get_consensus_diagnostics() or None
@@ -600,8 +528,8 @@ def process_video_source(
         
         # Initialize video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(VIDEO_OUTPUT_PATH, fourcc, fps, (frame_width, frame_height))
-        logger.info(f"Output video will be saved to: {VIDEO_OUTPUT_PATH}")
+        video_writer = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, fps, (frame_width, frame_height))
+        logger.info(f"Output video will be saved to: {OUTPUT_VIDEO_PATH}")
         
         # Initialize diagnostic history tracker with x sec consensus window and y sec ignore period
         diagnostic_history = DiagnosticHistory(
@@ -653,12 +581,20 @@ def process_video_source(
                     source_info,
                     is_video=True,
                     frame_id=frame_count,
-                    save_to_disk=SAVE_INTERMEDIATE_DIAGNOSTICS
+                    save_to_disk=SAVE_INTERMEDIATE_DIAGNOSTICS,
+                    diagnosis_timestamp=diagnosis_timestamp,
+                    session_folder_name=session_folder_name
                 )
                 
                 # Save cropped detections if enabled
                 if SAVE_CROPS:
-                    save_cropped_detections(frame, full_component_data, frame_count)
+                    save_cropped_detections(
+                        frame, 
+                        full_component_data, 
+                        frame_id=frame_count,
+                        diagnosis_timestamp=diagnosis_timestamp,
+                        parts_session_folder=parts_session_folder
+                    )
                 
                 # Add to diagnostic history with current timestamp
                 diagnostic_entry = {
@@ -764,38 +700,57 @@ def main():
         logger.error(f"Invalid INPUT_MODE: {INPUT_MODE}. Must be 'image', 'video', or 'camera'.")
         return timestamp, None
 
-    if INPUT_MODE == "video" and not os.path.exists(VIDEO_FILE_PATH):
+    if INPUT_MODE == "video" and not os.path.exists(TEST_VIDEO_PATH):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.error(f"Video file not found: {VIDEO_FILE_PATH}")
+        logger.error(f"Video file not found: {TEST_VIDEO_PATH}")
         return timestamp, None
 
-    if INPUT_MODE == "image" and not os.path.exists(IMAGE_PATH):
+    if INPUT_MODE == "image" and not os.path.exists(TEST_IMAGE_PATH):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.error(f"Image file not found: {IMAGE_PATH}")
+        logger.error(f"Image file not found: {TEST_IMAGE_PATH}")
         return timestamp, None
 
     # Initialize result variable
     result = None  # Store the return value
 
     # RECORD TIMESTAMP: Start of diagnostic operation (after validation)
-    diagnosis_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    diagnosis_start_dt = datetime.now()
+    diagnosis_timestamp = diagnosis_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Millisecond precision for collision prevention (identical ms for both session types)
+    ms_precision = diagnosis_start_dt.strftime("%f")[:-3]  # Trim to milliseconds
+    
+    # Session folder names with IDENTICAL timestamps/ms
+    session_folder_name = f"int_diagnostics_{diagnosis_start_dt.strftime('%Y%m%d_%H%M%S')}_{ms_precision}"
+    parts_session_folder = f"parts_{diagnosis_start_dt.strftime('%Y%m%d_%H%M%S')}_{ms_precision}"
+
+    logger.info(f"Session folder (diagnostics): {session_folder_name}")
+    logger.info(f"Session folder (cropped parts): {parts_session_folder}")
 
     try:
         if INPUT_MODE == "image":
             # Single image processing
             logger.info("Starting single image processing")
-            result = process_single_image(IMAGE_PATH, diagnosis_timestamp)
+            result = process_single_image(
+                TEST_IMAGE_PATH, 
+                diagnosis_timestamp, 
+                session_folder_name,
+                parts_session_folder
+            )
     
         elif INPUT_MODE in ("camera", "video"):
             # Video/Camera processing
             logger.info("Starting video/camera processing")
             consensus_result, success = process_video_source(
-                source_path=CAMERA_INDEX if INPUT_MODE == "camera" else VIDEO_FILE_PATH,
+                source_path=CAMERA_INDEX if INPUT_MODE == "camera" else TEST_VIDEO_PATH,
                 is_camera=(INPUT_MODE == "camera"),
                 camera_index=CAMERA_INDEX,
                 consensus_window=CONSENSUS_WINDOW_SECONDS,
                 ignore_period=IGNORE_PERIOD_SECONDS,
-                save_interval=SAVE_INTERVAL_SECONDS
+                save_interval=SAVE_INTERVAL_SECONDS,
+                session_folder_name=session_folder_name,
+                diagnosis_timestamp=diagnosis_timestamp,
+                parts_session_folder=parts_session_folder
             )        
 
             # Compile final results if successful consensus obtained
@@ -833,9 +788,27 @@ def main():
     
     finally:
         # Cleanup for both modes - THIS WILL ALWAYS RUN
+        
+        # 1. Remove temporary annotated image
         if os.path.exists(OUTPUT_IMAGE_PATH):
             os.remove(OUTPUT_IMAGE_PATH)
             logger.debug(f"Annotated image removed: {OUTPUT_IMAGE_PATH}")
+        
+        # 2. Interactive cleanup of intermediate diagnostics (if enabled)
+        if DELETE_INT_DIAGNOSTICS:
+            try:
+                cleanup_intermediate_diagnostics()
+            except Exception as e:
+                logger.warning(f"Intermediate diagnostics cleanup failed: {e}")
+        
+        # 3. Interactive cleanup of saved cropped parts (if enabled)
+        if DELETE_SAVED_CROPS:
+            try:
+                cleanup_saved_crops()
+            except Exception as e:
+                logger.warning(f"Saved crops cleanup failed: {e}")
+
+        # 4. Final completion log
         logger.info("Pipeline completed")
     
     return diagnosis_timestamp, result

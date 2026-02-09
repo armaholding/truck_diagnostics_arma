@@ -4,18 +4,7 @@ import re
 import uuid
 from datetime import datetime
 from typing import List, Optional, Tuple
-
-# --- Configuration ---
-DIAGNOSTICS_DIR = "diagnostics"  # Directory to store CSV files
-UNKNOWN_PLATE = "UNKNOWN_PLATE"
-UNKNOWN_DRIVER = "UNKNOWN_DRIVER"
-
-BLUE = "\033[94m"
-RED = "\033[91m"
-ORANGE = "\033[38;5;208m"
-GREEN = "\033[92m"
-CYAN = "\033[96m"
-RESET = "\033[0m"
+from config import DIAGNOSTICS_PATH, BLUE, RED, ORANGE, GREEN, CYAN, RESET
 
 
 def normalize_plate(plate: Optional[str]) -> str:
@@ -24,10 +13,10 @@ def normalize_plate(plate: Optional[str]) -> str:
     Handles None/empty values with placeholder.
     """
     if not plate or plate.strip() == "" or plate == "N/A":
-        return UNKNOWN_PLATE
+        return "UNKNOWN_PLATE"
     # Keep only alphanumeric chars, uppercase
     normalized = re.sub(r'[^A-Z0-9]', '', plate.upper().strip())
-    return normalized if normalized else UNKNOWN_PLATE
+    return normalized if normalized else "UNKNOWN_PLATE"
 
 
 def normalize_driver(driver_names: Optional[List[str]]) -> str:
@@ -36,12 +25,12 @@ def normalize_driver(driver_names: Optional[List[str]]) -> str:
     Handles None/empty lists with placeholder.
     """
     if not driver_names or not isinstance(driver_names, list) or len(driver_names) == 0:
-        return UNKNOWN_DRIVER
+        return "UNKNOWN_DRIVER"
     
     # In reality only 1 driver expected, but handle multi-driver safely
     valid_drivers = [d.strip() for d in driver_names if d and d.strip()]
     if not valid_drivers:
-        return UNKNOWN_DRIVER
+        return "UNKNOWN_DRIVER"
     
     # Sort alphabetically for consistency (though typically single driver)
     valid_drivers.sort()
@@ -183,9 +172,9 @@ def get_csv_path(year: str, month: str) -> str:
     Generate CSV path based on year and month.
     Ensures diagnostics directory exists.
     """
-    os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+    os.makedirs(DIAGNOSTICS_PATH, exist_ok=True)
     filename = f"{year}_{month}_main_diagnostics.csv"
-    return os.path.join(DIAGNOSTICS_DIR, filename)
+    return os.path.join(DIAGNOSTICS_PATH, filename)
 
 def compute_session_status(session_uuid: str, diagnostics_ng: Optional[List[str]]) -> str:
     """

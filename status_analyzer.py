@@ -6,12 +6,10 @@ import sys
 import shutil
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from config import DIAGNOSTICS_PATH
 
 # --- Configuration ---
-DIAGNOSTICS_DIR = "diagnostics"
 COMPARE_COLUMN = "compare_going_coming"
-BACKUP_SUFFIX = ".bak"
-
 
 def extract_session_state(uuid_value: str) -> Tuple[Optional[str], Optional[int], Optional[bool]]:
     """
@@ -34,7 +32,6 @@ def extract_session_state(uuid_value: str) -> Tuple[Optional[str], Optional[int]
     is_going = (direction == "going")
     
     return base_uuid, state_num, is_going
-
 
 def parse_broken_components(broken_str: str) -> List[str]:
     """
@@ -162,7 +159,7 @@ def process_csv_file(csv_path: str) -> bool:
         True if any pairs were processed, False otherwise
     """
     year_month = os.path.basename(csv_path).replace("_main_diagnostics.csv", "")
-    json_path = os.path.join(DIAGNOSTICS_DIR, f"{year_month}_compare_status.json")
+    json_path = os.path.join(DIAGNOSTICS_PATH, f"{year_month}_compare_status.json")
     
     # Load existing analysis for this month
     monthly_analysis = load_existing_json(json_path)
@@ -274,7 +271,7 @@ def process_csv_file(csv_path: str) -> bool:
     save_json_analysis(json_path, monthly_analysis)
     
     # Create backup before modifying CSV
-    backup_path = csv_path + BACKUP_SUFFIX
+    backup_path = csv_path + ".bak"
     shutil.copy2(csv_path, backup_path)
     print(f"💾 Created backup: {os.path.basename(backup_path)}")
     
@@ -296,14 +293,14 @@ def process_csv_file(csv_path: str) -> bool:
 
 def discover_monthly_csvs() -> List[str]:
     """Discover all monthly diagnostics CSV files in diagnostics directory."""
-    if not os.path.exists(DIAGNOSTICS_DIR):
-        print(f"❌ Diagnostics directory '{DIAGNOSTICS_DIR}' not found")
+    if not os.path.exists(DIAGNOSTICS_PATH):
+        print(f"❌ Diagnostics directory '{DIAGNOSTICS_PATH}' not found")
         return []
     
     csv_files = []
-    for fname in os.listdir(DIAGNOSTICS_DIR):
+    for fname in os.listdir(DIAGNOSTICS_PATH):
         if fname.endswith("_main_diagnostics.csv"):
-            csv_files.append(os.path.join(DIAGNOSTICS_DIR, fname))
+            csv_files.append(os.path.join(DIAGNOSTICS_PATH, fname))
     
     csv_files.sort()  # Process chronologically
     return csv_files
@@ -344,7 +341,7 @@ def main():
     
     print("\n" + "=" * 70)
     print(f"✅ Analysis complete. Processed {files_with_new_pairs} file(s) with new pairs.")
-    print(f"   JSON outputs saved as: YYYY_MM_compare_status.json in '{DIAGNOSTICS_DIR}/'")
+    print(f"   JSON outputs saved as: YYYY_MM_compare_status.json in '{DIAGNOSTICS_PATH}/'")
     print("=" * 70)
 
     return analyzer_timestamp, files_with_new_pairs

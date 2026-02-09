@@ -1,42 +1,16 @@
 # parts_diagnostics.py
 """Modular diagnostic functions for truck components."""
 
-import os
-import cv2
-import torch
-from transformers import AutoProcessor, AutoModelForImageTextToText
-import re
 import logging
-import tempfile
+import cv2
+import re
+import os
 from PIL import Image
+import tempfile
 from config import DIAGNOSTIC_THRESHOLD, EXPECTED_COMPONENT_COUNTS
+from utility import get_cached_vlm_model
 
 logger = logging.getLogger(__name__)
-
-# --- GLM-OCR Model Caching (mirrors YOLO caching pattern) ---
-_vlm_model = None
-_vlm_processor = None
-_vlm_device = None
-VLM_MODEL_PATH = "zai-org/GLM-OCR"  # Confirmed available per user
-
-def get_cached_vlm_model():
-    """
-    Get cached GLM-OCR model instance to avoid reloading between frames.
-    
-    Returns:
-        tuple: (model, processor, device)
-    """
-    global _vlm_model, _vlm_processor, _vlm_device
-    if _vlm_model is None:
-        _vlm_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Loading GLM-OCR model on {_vlm_device} (first inference ~2 seconds)...")
-        _vlm_processor = AutoProcessor.from_pretrained(VLM_MODEL_PATH)
-        _vlm_model = AutoModelForImageTextToText.from_pretrained(
-            VLM_MODEL_PATH,
-            dtype=torch.float16 if _vlm_device.type == "cuda" else torch.float32
-        ).to(_vlm_device)
-        logger.info(f"GLM-OCR model cached on {_vlm_device} - will reuse for all frames")
-    return _vlm_model, _vlm_processor, _vlm_device
 
 # --- VLM OCR Helper Function (Moroccan plate specific) ---
 def run_vlm_ocr_on_plate(plate_image):
@@ -49,9 +23,12 @@ def run_vlm_ocr_on_plate(plate_image):
         # Get cached VLM model/processor
         model, processor, device = get_cached_vlm_model()
 
-       # Convert OpenCV BGR → RGB → PIL (required by processor)
-        rgb_image = cv2.cvtColor(plate_image, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(rgb_image)
+        # STEP 1: Convert directly to grayscale (skip unnecessary RGB conversion)
+        gray = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY)
+        
+        # STEP 2: CLAHE - Contrast enhancement that preserves local details
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
 
         # CRITICAL: Prompt tailored for Moroccan plates with Arabic character
         prompt = (
@@ -62,7 +39,7 @@ def run_vlm_ocr_on_plate(plate_image):
 
         # Save to temp file for VLM (requires file path, not PIL object)
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False, dir='.') as tmp:
-            cv2.imwrite(tmp.name, plate_image)
+            cv2.imwrite(tmp.name, enhanced)
             image_path = tmp.name
 
         try:
@@ -111,6 +88,7 @@ def run_vlm_ocr_on_plate(plate_image):
             return cleaned
         
         finally:
+            # print("no clean up for checking purposes")  # Comment out cleanup for debugging
             # Cleanup temp file
             if os.path.exists(image_path):
                 os.unlink(image_path)
@@ -118,6 +96,7 @@ def run_vlm_ocr_on_plate(plate_image):
     except Exception as e:
         logger.error(f"GLM-OCR inference failed: {type(e).__name__}: {e}")
         return None
+
 
 # --- Modular Component Diagnostic Functions ---
 def check_mirrors(comp_data):

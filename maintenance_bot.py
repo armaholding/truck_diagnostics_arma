@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import logging
 from datetime import datetime
+from config import BLUE, RED, ORANGE, GREEN, CYAN, RESET
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -10,13 +11,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-BLUE = "\033[94m"
-RED = "\033[91m"
-ORANGE = "\033[38;5;208m"
-GREEN = "\033[92m"
-CYAN = "\033[96m"
-RESET = "\033[0m"
 
 # --- OpenAI Client Setup ---
 load_dotenv()

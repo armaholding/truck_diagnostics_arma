@@ -4,23 +4,14 @@ from PIL import Image, ImageDraw, ImageFont
 import json
 import logging
 import base64
+from config import (DRIVER_SOURCE_PATH, QR_CODE_PATH, GENERATED_NAMES_JSON, QRCODE_PREFIX,
+                    QR_VERSION, BOX_SIZE, BORDER, FONT_SIZE)
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s: %(message)s"
 )
-
-# Configuration
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TEXT_PATH = os.path.join(BASE_DIR, 'names.txt')
-QR_CODE_PATH = os.path.join(BASE_DIR, 'qr_codes')
-GENERATED_NAMES_JSON = os.path.join(BASE_DIR, 'generated_qr_names.json')
-QR_VERSION = 2  # QR version (1–40); 2 ≈ 25×25 modules
-BOX_SIZE = 20    # Pixels per QR module
-BORDER = 4       # Quiet zone (modules)
-FONT_SIZE = 40
-QRCODE_PREFIX = "arma_driver: "
 
 def load_generated_names() -> set:
     """Load previously generated names from JSON file."""
@@ -108,13 +99,13 @@ def main():
 
     # Read input names
     try:
-        with open(TEXT_PATH, 'r', encoding='utf-8') as f:
+        with open(DRIVER_SOURCE_PATH, 'r', encoding='utf-8') as f:
             names = [line.strip() for line in f if line.strip()]
         if not names:
             logging.warning("No names found in 'names.txt'.")
             return
     except FileNotFoundError:
-        logging.error(f"File not found: {TEXT_PATH}")
+        logging.error(f"File not found: {DRIVER_SOURCE_PATH}")
         return
 
     # Process each name
@@ -135,6 +126,6 @@ def main():
             logging.error(f"Name too long for QR version {QR_VERSION}: '{name}'. Increase version.")
 
 if __name__ == "__main__":
-    print(f"🚀 Generating QR codes from {TEXT_PATH} (skipping names where qr codes have been generated)...")
+    print(f"🚀 Generating QR codes from {DRIVER_SOURCE_PATH} (skipping names where qr codes have been generated)...")
     main()
     print("✅ Done!")

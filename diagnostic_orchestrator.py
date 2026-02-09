@@ -2,6 +2,7 @@ import logging
 import time
 from typing import Callable, Any, Optional
 from datetime import datetime
+from config import BLUE, RED, ORANGE, GREEN, CYAN, RESET
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -10,19 +11,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Module Names ---
 QR_CODE_SCANNER = "qr_code_scanner_rt"
 TRUCK_DIAGNOSER = "yolo_truck_rt"
 AI_RECOMMENDER = "maintenance_bot"
 STATUS_TRACKER = "status_tracker"
 STATUS_ANALYZER = "status_analyzer"
-RATE_LIMIT_DELAY = 1.0  # seconds between stages to avoid overload
 
-BLUE = "\033[94m"
-RED = "\033[91m"
-ORANGE = "\033[38;5;208m"
-GREEN = "\033[92m"
-CYAN = "\033[96m"
-RESET = "\033[0m"
+RATE_LIMIT_DELAY = 1.0  # seconds between stages to avoid overload
 
 # === Import main functions directly ===
 def import_main(module_name: str) -> Optional[Callable[..., Any]]:
@@ -203,7 +199,6 @@ else:
     logger.warning("❌ Skipping session tracking: status_tracker module not available")
 
 # --- STAGE 6: Truck Status Analysis ---
-
 user_input = input("Do you want to proceed with the truck status analysis? Press Enter to proceed, or 'n' to exit: ")
 if user_input == '':
     sa_main = import_main(STATUS_ANALYZER)
