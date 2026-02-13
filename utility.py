@@ -8,9 +8,10 @@ import cv2
 import logging
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
 import torch
 from ultralytics import YOLO
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
 # Import configuration constants
 from config import (
@@ -18,7 +19,17 @@ from config import (
     BLUE, RED, ORANGE, GREEN, CYAN, RESET
 )
 
+# Configure module-specific logger
 logger = logging.getLogger(__name__)
+
+# Load environment variables and validate HF token
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    raise EnvironmentError(
+        "HF_TOKEN environment variable not set. "
+        "Get your token from https://huggingface.co/settings/tokens and set it in .env file"
+    )
 
 # --- GPU/CPU Detection ---
 def get_device():
@@ -56,29 +67,33 @@ def get_cached_yolo_model():
         logger.info(f"YOLO model cached on {_yolo_device} - will reuse for all frames")
     return _yolo_model, _yolo_device
 
-# --- GLM-OCR Model Caching (mirrors YOLO caching pattern) ---
-_vlm_model = None
-_vlm_processor = None
-_vlm_device = None
+# --- Qari-OCR Model Caching (mirrors YOLO caching pattern) ---
+_qwen_model = None
+_qwen_processor = None
+_qwen_device = None
 
 def get_cached_vlm_model():
     """
-    Get cached GLM-OCR model instance to avoid reloading between frames.
+    Get cached Qari-OCR model instance to avoid reloading between frames.
     
     Returns:
         tuple: (model, processor, device)
+            - model: Cached Qwen2VL model instance
+            - processor: Associated processor for input preparation
+            - device: Device where model is loaded ('cuda' or 'cpu')
     """
-    global _vlm_model, _vlm_processor, _vlm_device
-    if _vlm_model is None:
-        _vlm_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Loading GLM-OCR model on {_vlm_device} (first inference ~2 seconds)...")
-        _vlm_processor = AutoProcessor.from_pretrained(VLM_MODEL_PATH)
-        _vlm_model = AutoModelForImageTextToText.from_pretrained(
-            VLM_MODEL_PATH,
-            dtype=torch.float16 if _vlm_device.type == "cuda" else torch.float32
-        ).to(_vlm_device)
-        logger.info(f"GLM-OCR model cached on {_vlm_device} - will reuse for all frames")
-    return _vlm_model, _vlm_processor, _vlm_device
+    global _qwen_model, _qwen_processor, _qwen_device
+    if _qwen_model is None:
+        _qwen_device = get_device()
+        _qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_name=VLM_MODEL_PATH,
+            torch_dtype=torch.bfloat16 if _qwen_device == "cuda" else torch.float32,
+            device_map="auto"
+        )
+        _qwen_processor = AutoProcessor.from_pretrained(
+            model_name=VLM_MODEL_PATH
+            )
+    return _qwen_model, _qwen_processor, _qwen_device
 
 # --- Object Detection Helper Functions ---
 def get_available_classes(model):
@@ -246,8 +261,8 @@ def cleanup_intermediate_diagnostics():
         return False
     
     # Present numbered list grouped by month
-    print(f"\n{CYAN}🗑️  INTERMEDIATE DIAGNOSTICS CLEANUP{RESET}")
-    print(f"Found {len(intermediate_folders)} intermediate diagnostic folder(s) across {len(set(m for m,_,_,_,_ in intermediate_folders))} month(s):\n")
+    logger.info(f"\n{CYAN}🗑️  INTERMEDIATE DIAGNOSTICS CLEANUP{RESET}")
+    logger.info(f"Found {len(intermediate_folders)} intermediate diagnostic folder(s) across {len(set(m for m,_,_,_,_ in intermediate_folders))} month(s):\n")
     
     current_month = None
     folder_map = {}  # Maps number -> (month, folder_path, folder_name)
@@ -262,31 +277,31 @@ def cleanup_intermediate_diagnostics():
                 month_name = month_dt.strftime("%B %Y")
             except:
                 month_name = f"{month[:4]}-{month[4:]}"
-            print(f"{BLUE}[{month}] {month_name}:{RESET}")
+            logger.info(f"{BLUE}[{month}] {month_name}:{RESET}")
         
-        print(f"  {counter}) {folder_name} ({file_count} file(s), {size_display})")
+        logger.info(f"  {counter}) {folder_name} ({file_count} file(s), {size_display})")
         folder_map[counter] = (month, folder_path, folder_name)
         counter += 1
     
-    print(f"\n{ORANGE}⚠️  WARNING:{RESET} This will PERMANENTLY DELETE selected folders and their contents.")
-    print(f"   Final diagnostic reports ({GREEN}final_*.json{RESET}) will NOT be affected.\n")
+    logger.info(f"\n{ORANGE}⚠️  WARNING:{RESET} This will PERMANENTLY DELETE selected folders and their contents.")
+    logger.info(f"   Final diagnostic reports ({GREEN}final_*.json{RESET}) will NOT be affected.\n")
     
     # Get user selection
     selection_input = input(f"Enter folder numbers to delete (e.g., {GREEN}\"1,3,5\"{RESET}), {GREEN}\"all\"{RESET} for all folders, or press Enter to skip: ").strip()
     
     # Handle empty selection
     if not selection_input:
-        print(f"\n{BLUE}ℹ️  No folders selected for deletion - cleanup skipped.{RESET}\n")
+        logger.info(f"\n{BLUE}ℹ️  No folders selected for deletion - cleanup skipped.{RESET}\n")
         return True
     
     # Parse selection
     selected_numbers = []
     if selection_input.lower() == 'all':
         selected_numbers = list(folder_map.keys())
-        print(f"\n{ORANGE}⚠️  BULK DELETION MODE:{RESET} You selected ALL {len(selected_numbers)} intermediate diagnostic folders.")
+        logger.info(f"\n{ORANGE}⚠️  BULK DELETION MODE:{RESET} You selected ALL {len(selected_numbers)} intermediate diagnostic folders.")
         extra_confirm = input(f"Type {RED}'CONFIRM ALL'{RESET} to proceed with bulk deletion, or anything else to cancel: ").strip()
         if extra_confirm != 'CONFIRM ALL':
-            print(f"\n{BLUE}ℹ️  Bulk deletion cancelled - cleanup skipped.{RESET}\n")
+            logger.info(f"\n{BLUE}ℹ️  Bulk deletion cancelled - cleanup skipped.{RESET}\n")
             return True
     else:
         # Parse comma-separated numbers
@@ -294,30 +309,30 @@ def cleanup_intermediate_diagnostics():
             parts = [p.strip() for p in selection_input.split(',')]
             selected_numbers = [int(p) for p in parts if p.isdigit()]
             if not selected_numbers:
-                print(f"\n{RED}❌ Invalid selection - no valid numbers found. Cleanup skipped.{RESET}\n")
+                logger.info(f"\n{RED}❌ Invalid selection - no valid numbers found. Cleanup skipped.{RESET}\n")
                 return True
         except ValueError:
-            print(f"\n{RED}❌ Invalid selection format. Cleanup skipped.{RESET}\n")
+            logger.info(f"\n{RED}❌ Invalid selection format. Cleanup skipped.{RESET}\n")
             return True
     
     # Validate selections
     invalid = [n for n in selected_numbers if n not in folder_map]
     if invalid:
-        print(f"\n{RED}❌ Invalid folder number(s): {', '.join(map(str, invalid))}. Cleanup skipped.{RESET}\n")
+        logger.info(f"\n{RED}❌ Invalid folder number(s): {', '.join(map(str, invalid))}. Cleanup skipped.{RESET}\n")
         return True
     
     # Build deletion preview
     folders_to_delete = [folder_map[n] for n in selected_numbers]
-    print(f"\n{ORANGE}✅ PREVIEW:{RESET} You are about to delete {len(folders_to_delete)} folder(s):")
+    logger.info(f"\n{ORANGE}✅ PREVIEW:{RESET} You are about to delete {len(folders_to_delete)} folder(s):")
     for month, folder_path, folder_name in folders_to_delete:
         # Show relative path for safety
         rel_path = os.path.relpath(folder_path, start=DIAGNOSTICS_PATH)
-        print(f"   - {rel_path}/")
+        logger.info(f"   - {rel_path}/")
     
     # Final confirmation
     confirm = input(f"\nType {RED}'CONFIRM'{RESET} to proceed with deletion, or anything else to cancel: ").strip()
     if confirm != 'CONFIRM':
-        print(f"\n{BLUE}ℹ️  Deletion cancelled - cleanup skipped.{RESET}\n")
+        logger.info(f"\n{BLUE}ℹ️  Deletion cancelled - cleanup skipped.{RESET}\n")
         return True
     
     # Perform deletion with safety validations
@@ -351,13 +366,13 @@ def cleanup_intermediate_diagnostics():
     
     # Report results
     if success_count > 0:
-        print(f"\n{GREEN}🗑️  Successfully deleted {success_count} intermediate diagnostic folder(s).{RESET}")
+        logger.info(f"\n{GREEN}🗑️  Successfully deleted {success_count} intermediate diagnostic folder(s).{RESET}")
     if failure_count > 0:
-        print(f"{RED}⚠️  Failed to delete {failure_count} folder(s) - see logs for details.{RESET}")
+        logger.info(f"{RED}⚠️  Failed to delete {failure_count} folder(s) - see logs for details.{RESET}")
     if success_count == 0 and failure_count == 0:
-        print(f"{BLUE}ℹ️  No folders deleted.{RESET}")
+        logger.info(f"{BLUE}ℹ️  No folders deleted.{RESET}")
     
-    print()  # Blank line for readability
+    logger.info("")  # Blank line for readability
     return True
 
 # --- Saved Cropped Parts Cleanup ---
@@ -428,8 +443,8 @@ def cleanup_saved_crops():
         return False
     
     # Present numbered list grouped by month
-    print(f"\n{CYAN}🖼️  SAVED CROPPED PARTS CLEANUP{RESET}")
-    print(f"Found {len(parts_folders)} cropped parts session folder(s) across {len(set(m for m,_,_,_,_ in parts_folders))} month(s):\n")
+    logger.info(f"\n{CYAN}🖼️  SAVED CROPPED PARTS CLEANUP{RESET}")
+    logger.info(f"Found {len(parts_folders)} cropped parts session folder(s) across {len(set(m for m,_,_,_,_ in parts_folders))} month(s):\n")
     
     current_month = None
     folder_map = {}  # Maps number -> (month, folder_path, folder_name)
@@ -444,31 +459,31 @@ def cleanup_saved_crops():
                 month_name = month_dt.strftime("%B %Y")
             except:
                 month_name = f"{month[:4]}-{month[4:]}"
-            print(f"{BLUE}[{month}] {month_name}:{RESET}")
+            logger.info(f"{BLUE}[{month}] {month_name}:{RESET}")
         
-        print(f"  {counter}) {folder_name} ({file_count} image(s), {size_display})")
+        logger.info(f"  {counter}) {folder_name} ({file_count} image(s), {size_display})")
         folder_map[counter] = (month, folder_path, folder_name)
         counter += 1
     
-    print(f"\n{ORANGE}⚠️  WARNING:{RESET} This will PERMANENTLY DELETE selected folders and their contents.")
-    print(f"   Legacy validation images ({GREEN}individual .jpg files{RESET}) will NOT be affected.\n")
+    logger.info(f"\n{ORANGE}⚠️  WARNING:{RESET} This will PERMANENTLY DELETE selected folders and their contents.")
+    logger.info(f"   Legacy validation images ({GREEN}individual .jpg files{RESET}) will NOT be affected.\n")
     
     # Get user selection
     selection_input = input(f"Enter folder numbers to delete (e.g., {GREEN}\"1,3,5\"{RESET}), {GREEN}\"all\"{RESET} for all folders, or press Enter to skip: ").strip()
     
     # Handle empty selection
     if not selection_input:
-        print(f"\n{BLUE}ℹ️  No folders selected for deletion - cleanup skipped.{RESET}\n")
+        logger.info(f"\n{BLUE}ℹ️  No folders selected for deletion - cleanup skipped.{RESET}\n")
         return True
     
     # Parse selection
     selected_numbers = []
     if selection_input.lower() == 'all':
         selected_numbers = list(folder_map.keys())
-        print(f"\n{ORANGE}⚠️  BULK DELETION MODE:{RESET} You selected ALL {len(selected_numbers)} cropped parts session folders.")
+        logger.info(f"\n{ORANGE}⚠️  BULK DELETION MODE:{RESET} You selected ALL {len(selected_numbers)} cropped parts session folders.")
         extra_confirm = input(f"Type {RED}'CONFIRM ALL'{RESET} to proceed with bulk deletion, or anything else to cancel: ").strip()
         if extra_confirm != 'CONFIRM ALL':
-            print(f"\n{BLUE}ℹ️  Bulk deletion cancelled - cleanup skipped.{RESET}\n")
+            logger.info(f"\n{BLUE}ℹ️  Bulk deletion cancelled - cleanup skipped.{RESET}\n")
             return True
     else:
         # Parse comma-separated numbers
@@ -476,30 +491,30 @@ def cleanup_saved_crops():
             parts = [p.strip() for p in selection_input.split(',')]
             selected_numbers = [int(p) for p in parts if p.isdigit()]
             if not selected_numbers:
-                print(f"\n{RED}❌ Invalid selection - no valid numbers found. Cleanup skipped.{RESET}\n")
+                logger.info(f"\n{RED}❌ Invalid selection - no valid numbers found. Cleanup skipped.{RESET}\n")
                 return True
         except ValueError:
-            print(f"\n{RED}❌ Invalid selection format. Cleanup skipped.{RESET}\n")
+            logger.info(f"\n{RED}❌ Invalid selection format. Cleanup skipped.{RESET}\n")
             return True
     
     # Validate selections
     invalid = [n for n in selected_numbers if n not in folder_map]
     if invalid:
-        print(f"\n{RED}❌ Invalid folder number(s): {', '.join(map(str, invalid))}. Cleanup skipped.{RESET}\n")
+        logger.info(f"\n{RED}❌ Invalid folder number(s): {', '.join(map(str, invalid))}. Cleanup skipped.{RESET}\n")
         return True
     
     # Build deletion preview
     folders_to_delete = [folder_map[n] for n in selected_numbers]
-    print(f"\n{ORANGE}✅ PREVIEW:{RESET} You are about to delete {len(folders_to_delete)} folder(s):")
+    logger.info(f"\n{ORANGE}✅ PREVIEW:{RESET} You are about to delete {len(folders_to_delete)} folder(s):")
     for month, folder_path, folder_name in folders_to_delete:
         # Show relative path for safety
         rel_path = os.path.relpath(folder_path, start=CROPPED_PARTS_PATH)
-        print(f"   - {rel_path}/")
+        logger.info(f"   - {rel_path}/")
     
     # Final confirmation
     confirm = input(f"\nType {RED}'CONFIRM'{RESET} to proceed with deletion, or anything else to cancel: ").strip()
     if confirm != 'CONFIRM':
-        print(f"\n{BLUE}ℹ️  Deletion cancelled - cleanup skipped.{RESET}\n")
+        logger.info(f"\n{BLUE}ℹ️  Deletion cancelled - cleanup skipped.{RESET}\n")
         return True
     
     # Perform deletion with safety validations
@@ -533,12 +548,12 @@ def cleanup_saved_crops():
     
     # Report results
     if success_count > 0:
-        print(f"\n{GREEN}🖼️  Successfully deleted {success_count} cropped parts session folder(s).{RESET}")
+        logger.info(f"\n{GREEN}🖼️  Successfully deleted {success_count} cropped parts session folder(s).{RESET}")
     if failure_count > 0:
-        print(f"{RED}⚠️  Failed to delete {failure_count} folder(s) - see logs for details.{RESET}")
+        logger.warning(f"{RED}⚠️  Failed to delete {failure_count} folder(s) - see logs for details.{RESET}")
     if success_count == 0 and failure_count == 0:
-        print(f"{BLUE}ℹ️  No folders deleted.{RESET}")
+        logger.info(f"{BLUE}ℹ️  No folders deleted.{RESET}")
     
-    print()  # Blank line for readability
+    logger.info()  # Blank line for readability
     return True
 
