@@ -7,11 +7,12 @@ import base64
 from config import (DRIVER_SOURCE_PATH, QR_CODE_PATH, GENERATED_NAMES_JSON, QRCODE_PREFIX,
                     QR_VERSION, BOX_SIZE, BORDER, FONT_SIZE)
 
-# Configure logging
+# --- Logging Configuration ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(levelname)s: %(message)s"
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
 def load_generated_names() -> set:
     """Load previously generated names from JSON file."""
@@ -23,10 +24,10 @@ def load_generated_names() -> set:
         if isinstance(names_list, list):
             return {name for name in names_list if isinstance(name, str)}
         else:
-            logging.warning(f"Unexpected format in {GENERATED_NAMES_JSON}. Expected list of strings.")
+            logger.warning(f"Unexpected format in {GENERATED_NAMES_JSON}. Expected list of strings.")
             return set()
     except (json.JSONDecodeError, Exception) as e:
-        logging.warning(f"Failed to load {GENERATED_NAMES_JSON}: {e}. Starting fresh.")
+        logger.warning(f"Failed to load {GENERATED_NAMES_JSON}: {e}. Starting fresh.")
         return set()
 
 def save_generated_names(names_set: set) -> None:
@@ -36,13 +37,14 @@ def save_generated_names(names_set: set) -> None:
         with open(GENERATED_NAMES_JSON, 'w', encoding='utf-8') as f:
             json.dump(names_list, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logging.error(f"Failed to save {GENERATED_NAMES_JSON}: {e}")
+        logger.error(f"Failed to save {GENERATED_NAMES_JSON}: {e}")
 
 def generate_qr_code(name: str, font) -> str:
     """
     Generate and save a QR code image for a single name.
     Returns the saved filename (without path).
     """
+    logger.info(f"Generating QR code for: '{name}'")
     # Encode payload: 'arma_driver: <name>' → Base64
     qr_data_raw = QRCODE_PREFIX + name
     qr_data = base64.b64encode(qr_data_raw.encode('utf-8')).decode('ascii')
@@ -80,6 +82,7 @@ def generate_qr_code(name: str, font) -> str:
     filename = f"{safe_name.replace(' ', '_')}.png"
     output_path = os.path.join(QR_CODE_PATH, filename)
     final_img.save(output_path)
+    logger.info(f"Saved QR code image: {output_path}")
 
     return filename
     
@@ -102,28 +105,28 @@ def main():
         with open(DRIVER_SOURCE_PATH, 'r', encoding='utf-8') as f:
             names = [line.strip() for line in f if line.strip()]
         if not names:
-            logging.warning("No names found in 'names.txt'.")
+            logger.warning("No names found in 'names.txt'.")
             return
     except FileNotFoundError:
-        logging.error(f"File not found: {DRIVER_SOURCE_PATH}")
+        logger.error(f"File not found: {DRIVER_SOURCE_PATH}")
         return
 
     # Process each name
     for name in names:
         if name in generated_names:
-            logging.info(f"Skipped (already generated): {name}")
+            logger.info(f"Skipped (already generated): {name}")
             continue
 
         try:
             filename = generate_qr_code(name, font)
-            logging.info(f"Saved: {filename} (label: '{name}')")
+            logger.info(f"Saved: {filename} (label: '{name}')")
 
             # Record success to avoid reprocessing (crash-safe)
             generated_names.add(name)
             save_generated_names(generated_names)
 
         except qrcode.exceptions.DataOverflowError:
-            logging.error(f"Name too long for QR version {QR_VERSION}: '{name}'. Increase version.")
+            logger.error(f"Name too long for QR version {QR_VERSION}: '{name}'. Increase version.")
 
 if __name__ == "__main__":
     print(f"🚀 Generating QR codes from {DRIVER_SOURCE_PATH} (skipping names where qr codes have been generated)...")

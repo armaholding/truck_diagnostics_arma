@@ -2,10 +2,17 @@ import csv
 import os
 import re
 import uuid
+import logging
 from datetime import datetime
 from typing import List, Optional, Tuple
 from config import DIAGNOSTICS_PATH, BLUE, RED, ORANGE, GREEN, CYAN, RESET
 
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 def normalize_plate(plate: Optional[str]) -> str:
     """
@@ -57,7 +64,7 @@ def parse_timestamp(timestamp_str: str) -> Tuple[str, str, str, str]:
         return date_str, year, month, time_only
     except (ValueError, TypeError) as e:
         # Fallback: use raw values with placeholders
-        print(f"{RED}⚠️  Failed to parse timestamp '{timestamp_str}': {e}{RESET}")
+        logger.warning(f"{RED}⚠️  Failed to parse timestamp '{timestamp_str}': {e}{RESET}")
         now = datetime.now()
         return (
             now.strftime("%Y-%m-%d"),
@@ -117,7 +124,7 @@ def find_existing_sessions(csv_path: str, date_str: str, plate: str, driver: str
         return existing_sessions
         
     except Exception as e:
-        print(f"{RED}⚠️  Error reading CSV {csv_path}: {e}{RESET}")
+        logger.error(f"{RED}⚠️  Error reading CSV {csv_path}: {e}{RESET}")
         return []
 
 
@@ -144,7 +151,7 @@ def determine_next_state(existing_sessions: List[Tuple[str, str]]) -> str:
     
     if base_uuid is None or state_num is None:
         # Malformed UUID in CSV → treat as new session
-        print(f"{ORANGE}⚠️  Malformed UUID '{last_uuid}' in CSV, generating new session{RESET}")
+        logger.warning(f"{ORANGE}⚠️  Malformed UUID '{last_uuid}' in CSV, generating new session{RESET}")
         base_uuid = str(uuid.uuid4())
         return f"going1-{base_uuid}"
     
@@ -290,15 +297,15 @@ def main(
             # Write row
             writer.writerow(row_data)
         
-        print(f"{GREEN}✅ Session stored successfully into {os.path.basename(csv_path)}:{RESET}")
-        print(f"   UUID: {session_uuid}")
-        print(f"   Driver: {normalized_driver} | Plate: {normalized_plate}")
-        print(f"   Time: {start_time_only} → {finish_time_only}")
-        print(f"   Status: {status_value}")  # NEW - feedback to user
+        logger.info(f"{GREEN}✅ Session stored successfully into {os.path.basename(csv_path)}:{RESET}")
+        logger.info(f"   UUID: {session_uuid}")
+        logger.info(f"   Driver: {normalized_driver} | Plate: {normalized_plate}")
+        logger.info(f"   Time: {start_time_only} → {finish_time_only}")
+        logger.info(f"   Status: {status_value}")  # NEW - feedback to user
         return table_timestamp, session_uuid
         
     except Exception as e:
-        print(f"{RED}❌ Failed to write to CSV {csv_path}: {e}{RESET}")
+        logger.error(f"{RED}❌ Failed to write to CSV {csv_path}: {e}{RESET}")
         return table_timestamp, f"ERROR-{session_uuid}"
 
 

@@ -10,16 +10,17 @@ import sys
 from config import (DRIVER_SOURCE_PATH, TEST_QR_IMAGE_PATH, TEST_VIDEO_PATH, INPUT_MODE,
                     QRCODE_PREFIX, BLUE, RED, ORANGE, GREEN, CYAN, RESET)
 
-# Configure logging (console output with level prefix)
+# --- Logging Configuration ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(levelname)s: %(message)s"
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
 def is_name_in_database(name_to_check):
     """Check if name exists in names.txt (case-insensitive). Returns original casing if found."""
     if not os.path.exists(DRIVER_SOURCE_PATH):
-        logging.error(f"Database file not found: {DRIVER_SOURCE_PATH}")
+        logger.error(f"Database file not found: {DRIVER_SOURCE_PATH}")
         return None
 
     target_lower = name_to_check.strip().lower()
@@ -31,7 +32,7 @@ def is_name_in_database(name_to_check):
                     return original_name
         return None
     except Exception as e:
-        logging.error(f"Error reading database: {e}")
+        logger.error(f"Error reading database: {e}")
         return None
 
 def extract_name_from_scanned(scanned_value: str) -> str:
@@ -112,12 +113,12 @@ def get_consensus_qr_from_frames(frame_generator, total_samples=7, interval_sec=
 def scan_from_image_file():
     """Decode QR from a static image file."""
     if not os.path.exists(TEST_QR_IMAGE_PATH):
-        logging.error(f"Image file not found: {TEST_QR_IMAGE_PATH}")
+        logger.error(f"Image file not found: {TEST_QR_IMAGE_PATH}")
         return None
     
     img = cv2.imread(TEST_QR_IMAGE_PATH)
     if img is None:
-        logging.error("Failed to load image")
+        logger.error("Failed to load image")
         return None
     
     qr_decoder = cv2.QRCodeDetector()
@@ -135,7 +136,7 @@ def scan_from_camera():
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        logging.error("Could not access camera")
+        logger.error("Could not access camera")
         return None
 
     def camera_frame_generator():
@@ -159,12 +160,12 @@ def scan_from_video_file():
     """Process first 3 seconds of video, collect all valid QR codes, return consensus."""
     print("📸 Opening video...")
     if not os.path.exists(TEST_VIDEO_PATH):
-        logging.error(f"Video file not found: {TEST_VIDEO_PATH}")
+        logger.error(f"Video file not found: {TEST_VIDEO_PATH}")
         return None
 
     cap = cv2.VideoCapture(TEST_VIDEO_PATH)
     if not cap.isOpened():
-        logging.error("Could not open video file")
+        logger.error("Could not open video file")
         return None
 
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -196,7 +197,7 @@ def scan_from_video_file():
     cap.release()
 
     if not sampled_qr_values:
-        logging.info("No QR codes detected in video sampling window")
+        logger.info("No QR codes detected in video sampling window")
         return None
 
     # Vote only among VALID samples
@@ -210,7 +211,7 @@ def scan_one_qr():
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        logging.error("Could not access camera")
+        logger.error("Could not access camera")
         return None
 
     qr_decoder = cv2.QRCodeDetector()
@@ -220,7 +221,7 @@ def scan_one_qr():
         while True:
             ret, frame = cap.read()
             if not ret:
-                logging.warning("Failed to grab camera frame")
+                logger.warning("Failed to grab camera frame")
                 break
 
             # Decode QR in current frame
@@ -254,20 +255,20 @@ def main():
     input_mode = INPUT_MODE.strip().lower()
     if input_mode not in ("camera", "video", "image"):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logging.error(f"Invalid INPUT_MODE: {INPUT_MODE}. Must be 'camera', 'video', or 'image'.")
+        logger.error(f"Invalid INPUT_MODE: {INPUT_MODE}. Must be 'camera', 'video', or 'image'.")
         return timestamp, None
 
     # File existence checks with timestamp on failure
     if input_mode == 'video':
         if not os.path.exists(TEST_VIDEO_PATH):
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            logging.error(f"Video file not found: {TEST_VIDEO_PATH}")
+            logger.error(f"Video file not found: {TEST_VIDEO_PATH}")
             return timestamp, None
     
     if input_mode == 'image':
         if not os.path.exists(TEST_QR_IMAGE_PATH):
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            logging.error(f"Image file not found: {TEST_QR_IMAGE_PATH}")
+            logger.error(f"Image file not found: {TEST_QR_IMAGE_PATH}")
             return timestamp, None
 
     # ✅ RECORD TIMESTAMP HERE: Start of actual scan operation
@@ -284,19 +285,19 @@ def main():
         elif input_mode == 'video':
             print("🎬 Processing video file (first 3 seconds)...")
             if not os.path.exists(TEST_VIDEO_PATH):
-                logging.error(f"Video file not found: {TEST_VIDEO_PATH}")
+                logger.error(f"Video file not found: {TEST_VIDEO_PATH}")
                 return None
             scanned = scan_from_video_file()
 
         elif input_mode == 'image':
             print("🖼️  Processing image file...")
             if not os.path.exists(TEST_QR_IMAGE_PATH):
-                logging.error(f"Image file not found: {TEST_QR_IMAGE_PATH}")
+                logger.error(f"Image file not found: {TEST_QR_IMAGE_PATH}")
                 return None
             scanned = scan_from_image_file()
 
     except Exception as e:
-        logging.error(f"Scan execution failed: {e}")
+        logger.error(f"Scan execution failed: {e}")
         return timestamp, None
 
     # Determine scan outcome

@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import logging
 from datetime import datetime
-from config import BLUE, RED, ORANGE, GREEN, CYAN, RESET
+from config import MAINENANCE_BOT_MODEL, BLUE, RED, ORANGE, GREEN, CYAN, RESET
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -19,7 +19,6 @@ if not openai_api_key:
     raise EnvironmentError("Please set the OPENAI_API_KEY environment variable.")
 
 client = OpenAI(api_key=openai_api_key)
-MODEL = "gpt-4o-mini"
 
 # --- Sub-function: Generate Repair Instructions for NG Items ---
 def generate_repair_instructions(diagnostics_ng):
@@ -54,7 +53,7 @@ def generate_repair_instructions(diagnostics_ng):
     try:
         logger.info("Sending NG diagnostics to LLM for repair recommendations...")
         fix_response = client.chat.completions.create(
-            model=MODEL,
+            model=MAINENANCE_BOT_MODEL,
             messages=[{"role": "user", "content": fix_prompt}],
             temperature=0.2,
             max_tokens=500
@@ -101,7 +100,7 @@ def generate_maintenance_tips(diagnostics_ok):
     try:
         logger.info("Sending OK diagnostics to LLM for maintenance tips...")
         maintain_response = client.chat.completions.create(
-            model=MODEL,
+            model=MAINENANCE_BOT_MODEL,
             messages=[{"role": "user", "content": maintain_prompt}],
             temperature=0.5,
             max_tokens=500

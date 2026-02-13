@@ -221,7 +221,7 @@ def process_diagnostics_and_save(
         diagnostics_log = diag_messages
     else:
         msg = "truck face not detected — no diagnostics performed"
-        print(msg)
+        logger.info(msg)
         logger.warning(msg)
         diagnostics_log = [msg]
 
@@ -237,7 +237,7 @@ def process_diagnostics_and_save(
 
     # Print diagnostics to console
     for msg in diagnostics_log:
-        print(msg)
+        logger.info(msg)
 
     # --- Build enhanced truck_components using RAW data ---
     enhanced_components = {}
@@ -820,7 +820,7 @@ if __name__ == "__main__":
     print(f"\n⏱️  Diagnosis performed at: {BLUE}{diagnosis_timestamp}{RESET}")
     
     if results is None:
-        print(f"{RED}❌ Truck inspection failed: no results generated.{RESET}")
+        logger.error(f"{RED}❌ Truck inspection failed: no results generated.{RESET}")
 
     else:
         truck_face = results["truck_face"]
@@ -847,4 +847,4 @@ if __name__ == "__main__":
         else:
             print(f"\n{RED}🔧 Required repairs:{RESET}")
             for issue in diagnostics_ng:
-                print("  ", issue)
+                print(f"  {issue}")

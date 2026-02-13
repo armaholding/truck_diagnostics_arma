@@ -8,12 +8,12 @@ DRIVER_SOURCE_PATH = os.path.join(BASE_PATH, 'names.txt')
 QR_CODE_PATH = os.path.join(BASE_PATH, 'qr_codes')
 GENERATED_NAMES_JSON = os.path.join(BASE_PATH, 'generated_qr_names.json')
 TEST_QR_IMAGE_PATH = os.path.join(BASE_PATH, 'qr_codes', 'alvin_hernandez.png') # Default test qr code image
-TEST_IMAGE_PATH = os.path.join(BASE_PATH, 'truck_test', 'truckb4.jpg')  # Default test image
-TEST_VIDEO_PATH = os.path.join(BASE_PATH, 'truck_test', 'test_video1.mp4') # Default test video
+TEST_IMAGE_PATH = os.path.join(BASE_PATH, 'truck_test', 'truckb4.jpg')          # Default test image
+TEST_VIDEO_PATH = os.path.join(BASE_PATH, 'truck_test', 'test_video2.mp4')      # Default test video
 OUTPUT_IMAGE_PATH = os.path.join(BASE_PATH, "annotated_image.jpg")
 OUTPUT_VIDEO_PATH = os.path.join(BASE_PATH, "output_video.mp4")
-DIAGNOSTICS_PATH = os.path.join(BASE_PATH, "diagnostics")  # Directory to store the diagnostic files
-CROPPED_PARTS_PATH = os.path.join(BASE_PATH, "cropped_parts")
+DIAGNOSTICS_PATH = os.path.join(BASE_PATH, "diagnostics")                       # Directory to store the diagnostic files
+CROPPED_PARTS_PATH = os.path.join(BASE_PATH, "cropped_parts")                   # Directory to store cropped part images
 
 # QR code generation parameters
 QR_VERSION = 2   # QR version (1–40); 2 ≈ 25×25 modules
@@ -22,16 +22,17 @@ BORDER = 4       # Quiet zone (modules)
 FONT_SIZE = 40   # Font size for name label
 
 # --- Operational Constants ---
-QRCODE_PREFIX = "arma_driver: " # Prefix for QR payload
-INPUT_MODE = "video"  # Options: "image", "camera", "video"
-YOLO_MODEL_PATH = 'truck7.pt'  # Path to the YOLO model
-VLM_MODEL_PATH = "zai-org/GLM-OCR"  # Path to the VLM OCR model (confirm availability on Hugging Face)
+QRCODE_PREFIX = "arma_driver: "                    # Prefix for QR payload
+INPUT_MODE = "video"                               # Options: "image", "camera", "video"
+YOLO_MODEL_PATH = 'truck7.pt'                      # Path to the YOLO model
+VLM_MODEL_PATH = "NAMAA-Space/Qari-OCR-v0.3-VL-2B-Instruct"  # Path to the VLM OCR model
+MAINENANCE_BOT_MODEL = "gpt-4o-mini"                              # OpenAI model for repair instructions
 
 # --- Input & Tracking Configuration ---
 CAMERA_INDEX = 0               # Default camera index for live feed
 CONSENSUS_WINDOW_SECONDS = 18  # Time window for consensus diagnostics
 IGNORE_PERIOD_SECONDS = 2      # Initial ignore period for unstable detections
-SAVE_INTERVAL_SECONDS = 2.5    # Interval to save intermediate diagnostics
+SAVE_INTERVAL_SECONDS = 3      # Interval to save intermediate diagnostics
 TRACKER_TYPE = "botsort.yaml"  # or "bytetrack.yaml"
 
 # --- Diagnostic Configuration ---

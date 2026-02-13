@@ -4,12 +4,21 @@ import os
 import re
 import sys
 import shutil
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from config import DIAGNOSTICS_PATH
 
 # --- Configuration ---
 COMPARE_COLUMN = "compare_going_coming"
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 
 def extract_session_state(uuid_value: str) -> Tuple[Optional[str], Optional[int], Optional[bool]]:
     """
@@ -110,14 +119,14 @@ def prompt_user_reason(plate: str, driver: str, identified_parts: List[str]) -> 
     Prompt user for reason of degradation/damage for identified parts.
     Returns user input or default if non-interactive.
     """
-    print(f"\n🚨 DEGRADATION DETECTED for {plate} ({driver})")
-    print(f"   Newly identified broken components:")
+    logger.info(f"\n🚨 DEGRADATION DETECTED for {plate} ({driver})")
+    logger.info(f"   Newly identified broken components:")
     for i, part in enumerate(identified_parts, 1):
-        print(f"   {i}. {part}")
+        logger.info(f"   {i}. {part}")
     
     # Check if running in interactive terminal
     if not sys.stdin.isatty():
-        print("⚠️  Non-interactive mode - skipping user prompt. Use default note.")
+        logger.warning("⚠️  Non-interactive mode - skipping user prompt. Use default note.")
         return "reason not provided (non-interactive mode)"
     
     reason = input("   ➡️  What caused this degradation/damage? (press Enter to skip): ").strip()
@@ -133,7 +142,7 @@ def load_existing_json(json_path: str) -> Dict:
             with open(json_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
-            print(f"⚠️  Failed to load {json_path}: {e}. Starting fresh.")
+            logger.error(f"⚠️  Failed to load {json_path}: {e}. Starting fresh.")
     return {}
 
 
@@ -142,9 +151,9 @@ def save_json_analysis(json_path: str, analysis_data: Dict):
     try:
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(analysis_data, f, indent=2, ensure_ascii=False)
-        print(f"✅ Analysis saved to {json_path}")
+        logger.info(f"✅ Analysis saved to {json_path}")
     except Exception as e:
-        print(f"❌ Failed to save {json_path}: {e}")
+        logger.error(f"❌ Failed to save {json_path}: {e}")
 
 
 def process_csv_file(csv_path: str) -> bool:
@@ -171,7 +180,7 @@ def process_csv_file(csv_path: str) -> bool:
             rows = list(reader)
             fieldnames = reader.fieldnames or []
     except Exception as e:
-        print(f"❌ Failed to read {csv_path}: {e}")
+        logger.error(f"❌ Failed to read {csv_path}: {e}")
         return False
     
     # Add compare_going_coming column if missing
@@ -179,7 +188,7 @@ def process_csv_file(csv_path: str) -> bool:
         fieldnames = list(fieldnames) + [COMPARE_COLUMN]
         for row in rows:
             row[COMPARE_COLUMN] = ""
-        print(f"➕ Added new column '{COMPARE_COLUMN}' to {os.path.basename(csv_path)}")
+        logger.info(f"➕ Added new column '{COMPARE_COLUMN}' to {os.path.basename(csv_path)}")
     
     # Group rows by (date, base_uuid, trip_number) for pairing
     pairs: Dict[Tuple[str, str, int], Dict[str, Dict]] = {}
@@ -261,10 +270,10 @@ def process_csv_file(csv_path: str) -> bool:
             coming_row[COMPARE_COLUMN] = "compared"
             rows_to_update.extend([going_row, coming_row])
             
-            print(f"✅ Analyzed pair {base_uuid} (trip #{trip_num}) on {date_val}: {compare_status}")
+            logger.info(f"✅ Analyzed pair {base_uuid} (trip #{trip_num}) on {date_val}: {compare_status}")
     
     if processed_count == 0:
-        print(f"ℹ️  No new unprocessed pairs found in {os.path.basename(csv_path)}")
+        logger.info(f"ℹ️  No new unprocessed pairs found in {os.path.basename(csv_path)}")
         return False
     
     # Save updated JSON analysis
@@ -273,7 +282,7 @@ def process_csv_file(csv_path: str) -> bool:
     # Create backup before modifying CSV
     backup_path = csv_path + ".bak"
     shutil.copy2(csv_path, backup_path)
-    print(f"💾 Created backup: {os.path.basename(backup_path)}")
+    logger.info(f"💾 Created backup: {os.path.basename(backup_path)}")
     
     # Write updated CSV with marked pairs
     try:
@@ -281,10 +290,10 @@ def process_csv_file(csv_path: str) -> bool:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)  # All rows (updated + unchanged)
-        print(f"✅ Updated {os.path.basename(csv_path)} with {processed_count} compared pairs")
+        logger.info(f"✅ Updated {os.path.basename(csv_path)} with {processed_count} compared pairs")
     except Exception as e:
-        print(f"❌ Failed to update CSV {csv_path}: {e}")
-        print(f"   Restoring from backup...")
+        logger.error(f"❌ Failed to update CSV {csv_path}: {e}")
+        logger.info(f"   Restoring from backup...")
         shutil.copy2(backup_path, csv_path)
         return False
     
@@ -294,7 +303,7 @@ def process_csv_file(csv_path: str) -> bool:
 def discover_monthly_csvs() -> List[str]:
     """Discover all monthly diagnostics CSV files in diagnostics directory."""
     if not os.path.exists(DIAGNOSTICS_PATH):
-        print(f"❌ Diagnostics directory '{DIAGNOSTICS_PATH}' not found")
+        logger.error(f"❌ Diagnostics directory '{DIAGNOSTICS_PATH}' not found")
         return []
     
     csv_files = []
@@ -314,35 +323,35 @@ def main():
             - analyzer_timestamp: ISO 8601 timestamp when analysis ran
             - files_with_new_pairs: Number of CSV files that had new unprocessed pairs analyzed (0 if none)
     """
-    print("🚛 Fleet Diagnostics Analyzer - Action_1: Going/Coming Comparison")
-    print("=" * 70)
+    logger.info("🚛 Fleet Diagnostics Analyzer - Action_1: Going/Coming Comparison")
+    logger.info("=" * 50)
     
     analyzer_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     csv_files = discover_monthly_csvs()
     
     if not csv_files:
-        print("⚠️  No monthly diagnostics CSV files found in 'diagnostics/' directory")
-        print(f"   Expected pattern: YYYY_MM_main_diagnostics.csv")
+        logger.warning("⚠️  No monthly diagnostics CSV files found in 'diagnostics/' directory")
+        logger.info(f"   Expected pattern: YYYY_MM_main_diagnostics.csv")
         return analyzer_timestamp, 0
     
-    print(f"📁 Found {len(csv_files)} monthly CSV file(s) to process:\n")
+    logger.info(f"📁 Found {len(csv_files)} monthly CSV file(s) to process:\n")
     for i, csv_path in enumerate(csv_files, 1):
-        print(f"   {i}. {os.path.basename(csv_path)}")
+        logger.info(f"   {i}. {os.path.basename(csv_path)}")
     
-    print("\n" + "=" * 70)
+    logger.info("\n" + "=" * 50)
     
     files_with_new_pairs = 0
 
     for csv_path in csv_files:
-        print(f"\n📄 Processing: {os.path.basename(csv_path)}")
-        print("-" * 70)
+        logger.info(f"\n📄 Processing: {os.path.basename(csv_path)}")
+        logger.info("-" * 50)
         if process_csv_file(csv_path):
             files_with_new_pairs += 1
     
-    print("\n" + "=" * 70)
-    print(f"✅ Analysis complete. Processed {files_with_new_pairs} file(s) with new pairs.")
-    print(f"   JSON outputs saved as: YYYY_MM_compare_status.json in '{DIAGNOSTICS_PATH}/'")
-    print("=" * 70)
+    logger.info("\n" + "=" * 50)
+    logger.info(f"✅ Analysis complete. Processed {files_with_new_pairs} file(s) with new pairs.")
+    logger.info(f"   JSON outputs saved as: YYYY_MM_compare_status.json in '{DIAGNOSTICS_PATH}/'")
+    logger.info("=" * 50)
 
     return analyzer_timestamp, files_with_new_pairs
 
