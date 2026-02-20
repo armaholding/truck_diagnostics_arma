@@ -3,14 +3,34 @@ import tempfile
 import os
 import torch
 from PIL import Image
+from pathlib import Path
 from utility_test import get_cached_vlm_model
 from qwen_vl_utils import process_vision_info
+
+# Get script directory for relative path resolution
+SCRIPT_DIR = Path(__file__).resolve().parent
+PLATE_FOLDER = SCRIPT_DIR / "plate_number"  # Images now in "plate_number" folder
+DEFAULT_PLATE_IMAGE = PLATE_FOLDER / "moroccan_plate_number3.jpg"
+
 
 def segment_moroccan_plate(image_path):
     img = cv2.imread(image_path)
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+    # Resize grayscale image to consistent dimensions ---
+    TARGET_WIDTH, TARGET_HEIGHT = 250, 96
+    
+    # Choose interpolation based on resize direction for best quality
+    if gray.shape[1] > TARGET_WIDTH:  # Downscaling
+        interpolation = cv2.INTER_AREA
+    else:  # Upscaling
+        interpolation = cv2.INTER_LINEAR
+    
+    gray_resized = cv2.resize(gray, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=interpolation)
+
+    # Apply Otsu's thresholding to get binary image
+    _, binary = cv2.threshold(gray_resized, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     
     # Find all character contours (digits + Arabic)
     contours, _ = cv2.findContours(
@@ -130,16 +150,19 @@ def ocr_plate_segments(left_region, middle_region, right_region):
 
 # Usage example
 if __name__ == "__main__":
+    # Use DEFAULT_PLATE_IMAGE constant from configuration
+    print(f"Processing plate image: {DEFAULT_PLATE_IMAGE}")
+
     # Step 1: Segment the plate
-    left, middle, right = segment_moroccan_plate("moroccan_plate_number3.jpg")
+    left, middle, right = segment_moroccan_plate(DEFAULT_PLATE_IMAGE)
     
     # Step 2: Perform OCR on segments
     left_digits, arabic_char, right_digits = ocr_plate_segments(left, middle, right)
     
     # Save segmented regions
-    cv2.imwrite("left.jpg", left)
-    cv2.imwrite("middle.jpg", middle)
-    cv2.imwrite("right.jpg", right)
+    cv2.imwrite(str(PLATE_FOLDER / f"left.jpg"), left)
+    cv2.imwrite(str(PLATE_FOLDER / f"middle.jpg"), middle)
+    cv2.imwrite(str(PLATE_FOLDER / f"right.jpg"), right)
     
     # Print results
     print(f"Detected plate: {left_digits} | {arabic_char or 'MISSING'} | {right_digits}")
