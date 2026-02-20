@@ -22,7 +22,20 @@ def segment_moroccan_plate(plate_image):
     """
     h, w = plate_image.shape[:2]
     gray = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+    # Resize grayscale image to consistent dimensions ---
+    TARGET_WIDTH, TARGET_HEIGHT = 250, 96
+    
+    # Choose interpolation based on resize direction for best quality
+    if gray.shape[1] > TARGET_WIDTH:  # Downscaling
+        interpolation = cv2.INTER_AREA
+    else:  # Upscaling
+        interpolation = cv2.INTER_LINEAR
+    
+    gray_resized = cv2.resize(gray, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=interpolation)
+
+    # Apply Otsu's thresholding to get binary image
+    _, binary = cv2.threshold(gray_resized, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     
     # Find all character contours (digits + Arabic)
     contours, _ = cv2.findContours(
