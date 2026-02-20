@@ -132,7 +132,7 @@ def scan_from_image_file():
 
 def scan_from_camera():
     """Capture QR codes from camera over 3 seconds (7 samples), return consensus value."""
-    print("📸 Opening camera... Hold QR code steady for 3 seconds.")
+    logger.info("📸 Opening camera... Hold QR code steady for 3 seconds.")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -158,7 +158,7 @@ def scan_from_camera():
 
 def scan_from_video_file():
     """Process first 3 seconds of video, collect all valid QR codes, return consensus."""
-    print("📸 Opening video...")
+    logger.info("📸 Opening video...")
     if not os.path.exists(TEST_VIDEO_PATH):
         logger.error(f"Video file not found: {TEST_VIDEO_PATH}")
         return None
@@ -207,7 +207,7 @@ def scan_from_video_file():
 
 def scan_one_qr():
     """Capture a single QR code from the default camera with live preview."""
-    print("📸 Opening camera... Show a QR code.")
+    logger.info("📸 Opening camera... Show a QR code.")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -279,18 +279,18 @@ def main():
 
     try:
         if input_mode == 'camera':
-            print("📸 Opening camera... Hold QR code steady for 3 seconds.")
+            logger.info("📸 Opening camera... Hold QR code steady for 3 seconds.")
             scanned = scan_from_camera()
 
         elif input_mode == 'video':
-            print("🎬 Processing video file (first 3 seconds)...")
+            logger.info("🎬 Processing video file (first 3 seconds)...")
             if not os.path.exists(TEST_VIDEO_PATH):
                 logger.error(f"Video file not found: {TEST_VIDEO_PATH}")
                 return None
             scanned = scan_from_video_file()
 
         elif input_mode == 'image':
-            print("🖼️  Processing image file...")
+            logger.info("🖼️  Processing image file...")
             if not os.path.exists(TEST_QR_IMAGE_PATH):
                 logger.error(f"Image file not found: {TEST_QR_IMAGE_PATH}")
                 return None
@@ -304,25 +304,25 @@ def main():
     if scanned is None:
         # Distinguish cancellation from detection failure (for UX only)
         if input_mode == 'camera':
-            print("⚠️  Scan canceled by user")
+            logger.warning("⚠️  Scan canceled by user")
         else:
-            print("⚠️  Scan failed: No QR code detected")
+            logger.warning("⚠️  Scan failed: No QR code detected")
         return timestamp, None
 
     # QR successfully detected and decoded → process immediately
-    print(f"🔍 RAW SCANNED VALUE: [{repr(scanned)}]")
-    print(f"    Length: {len(scanned)}")
+    logger.info(f"🔍 RAW SCANNED VALUE: [{repr(scanned)}]")
+    logger.info(f"    Length: {len(scanned)}")
           
     try:
         name_to_check = extract_name_from_scanned(scanned)
         matched_name = is_name_in_database(name_to_check)
         if matched_name is not None:
-            print(f"✅ {matched_name} is in the database")
+            logger.info(f"✅ {matched_name} is in the database")
             matched_names.append(matched_name)
         else:
-            print(f"❌ Scanned name not in database: '{name_to_check}'")
+            logger.warning(f"❌ Scanned name not in database: '{name_to_check}'")
     except IndexError as e:
-        print(f"❌ Invalid QR format: {e}")
+        logger.error(f"❌ Invalid QR format: {e}")
         return timestamp, None
     
     return timestamp, matched_names

@@ -13,12 +13,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-IMAGE_FOLDER = "image_storage"
-TARGET_WIDTH = 478
-TARGET_HEIGHT = 850
-CROP_WIDTH = 478   # Set to <= TARGET_WIDTH
-CROP_HEIGHT = 600  # Set to <= TARGET_HEIGHT
+IMAGE_FOLDER = "truck_photos5"  # Folder containing subfolders with images to process
+TARGET_WIDTH = 4576
+TARGET_HEIGHT = 2574
+CROP_WIDTH = 3350   # Output width, set to <= TARGET_WIDTH
+CROP_HEIGHT = 2574  # Output height, set to <= TARGET_HEIGHT
 CROP_PROBABILITY = 0.5  # 50% chance to crop
+
+# note:
+# TARGET_WIDTH = 1920, TARGET_HEIGHT = 1080, CROP_WIDTH = 1500, CROP_HEIGHT = 1080
+# TARGET_WIDTH = 4576, TARGET_HEIGHT = 2574, CROP_WIDTH = 3350, CROP_HEIGHT = 2574
+
 
 def is_valid_jpeg(path: str) -> bool:
     """

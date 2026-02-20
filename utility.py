@@ -86,12 +86,12 @@ def get_cached_vlm_model():
     if _qwen_model is None:
         _qwen_device = get_device()
         _qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_name=VLM_MODEL_PATH,
+            VLM_MODEL_PATH,
             torch_dtype=torch.bfloat16 if _qwen_device == "cuda" else torch.float32,
             device_map="auto"
         )
         _qwen_processor = AutoProcessor.from_pretrained(
-            model_name=VLM_MODEL_PATH
+            VLM_MODEL_PATH
             )
     return _qwen_model, _qwen_processor, _qwen_device
 
@@ -554,6 +554,6 @@ def cleanup_saved_crops():
     if success_count == 0 and failure_count == 0:
         logger.info(f"{BLUE}ℹ️  No folders deleted.{RESET}")
     
-    logger.info()  # Blank line for readability
+    logger.info("")  # Blank line for readability
     return True
 

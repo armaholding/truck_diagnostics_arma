@@ -7,9 +7,9 @@ BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 DRIVER_SOURCE_PATH = os.path.join(BASE_PATH, 'names.txt')
 QR_CODE_PATH = os.path.join(BASE_PATH, 'qr_codes')
 GENERATED_NAMES_JSON = os.path.join(BASE_PATH, 'generated_qr_names.json')
-TEST_QR_IMAGE_PATH = os.path.join(BASE_PATH, 'qr_codes', 'alvin_hernandez.png') # Default test qr code image
-TEST_IMAGE_PATH = os.path.join(BASE_PATH, 'truck_test', 'truckb4.jpg')          # Default test image
-TEST_VIDEO_PATH = os.path.join(BASE_PATH, 'truck_test', 'test_video2.mp4')      # Default test video
+TEST_QR_IMAGE_PATH = os.path.join(BASE_PATH, 'qr_codes', 'alvin_hernandez.png') # Test qr code image
+TEST_IMAGE_PATH = os.path.join(BASE_PATH, 'truck_test', 'truckb4.jpg')          # Test image
+TEST_VIDEO_PATH = os.path.join(BASE_PATH, 'truck_test', 'test_video1.mp4')      # Test video
 OUTPUT_IMAGE_PATH = os.path.join(BASE_PATH, "annotated_image.jpg")
 OUTPUT_VIDEO_PATH = os.path.join(BASE_PATH, "output_video.mp4")
 DIAGNOSTICS_PATH = os.path.join(BASE_PATH, "diagnostics")                       # Directory to store the diagnostic files
@@ -34,6 +34,7 @@ CONSENSUS_WINDOW_SECONDS = 18  # Time window for consensus diagnostics
 IGNORE_PERIOD_SECONDS = 2      # Initial ignore period for unstable detections
 SAVE_INTERVAL_SECONDS = 3      # Interval to save intermediate diagnostics
 TRACKER_TYPE = "botsort.yaml"  # or "bytetrack.yaml"
+IOU_THRESHOLD = 0.35
 
 # --- Diagnostic Configuration ---
 DIAGNOSTIC_THRESHOLD = 0.40  # for "ok" vs "ng"

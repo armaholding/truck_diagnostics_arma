@@ -5,7 +5,7 @@ import os
 # Configuration (match your CLI args)
 # ==============================
 MODEL_PATH = "yolo11m.pt"  # or "yolov8m.pt" if using standard model
-DATA_YAML = "../truck_diagnostics_arma/truck_parts-10/data.yaml"
+DATA_YAML = "truck_parts-13/data.yaml"
 EPOCHS = 180
 IMG_SIZE = 640
 DEVICE = 0  # GPU 0; use 'cpu' for CPU

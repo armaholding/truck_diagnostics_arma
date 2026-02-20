@@ -12,7 +12,7 @@ diagnostics/
 image_storage/
 
 # Model training outputs
-runs/
+runs*/
 
 # Roboflow dataset downloads
 truck_parts-*/

@@ -53,7 +53,7 @@ roboflow_api_key = os.getenv("ROBOFLOW_API_KEY")
 # Step 1: Download dataset in yolov8 format
 rf = Roboflow(api_key=roboflow_api_key)
 project = rf.workspace("ml-project-ymokd").project("truck_parts")
-version = project.version(10)
+version = project.version(13)
 dataset = version.download("yolov11")
 
 print("✅ Dataset downloaded. Cleaning labels...")
