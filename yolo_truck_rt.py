@@ -6,7 +6,7 @@ from datetime import datetime
 import re
 from config import (TEST_IMAGE_PATH, OUTPUT_IMAGE_PATH, TEST_VIDEO_PATH, OUTPUT_VIDEO_PATH, DIAGNOSTICS_PATH,
                     INPUT_MODE, EXPECTED_COMPONENT_COUNTS, FRONT_EXPECTED_COMPONENTS, BACK_EXPECTED_COMPONENTS,
-                    TRACKER_TYPE, CAMERA_INDEX, CONSENSUS_WINDOW_SECONDS, IGNORE_PERIOD_SECONDS, SAVE_INTERVAL_SECONDS,
+                    TRACKER_TYPE, CAMERA_INDEX, CONSENSUS_WINDOW_SECONDS, IGNORE_PERIOD_SECONDS, SAVE_INTERVAL_SECONDS, IOU_THRESHOLD,
                     SAVE_INTERMEDIATE_DIAGNOSTICS, DELETE_INT_DIAGNOSTICS, SAVE_CROPS, DELETE_SAVED_CROPS,
                     BLUE, RED, ORANGE, GREEN, CYAN, RESET)
 from utility import (
@@ -75,10 +75,15 @@ def detect_or_track_objects(source, is_video=False, frame_id=0):
         results = model.track(
             source,
             tracker=TRACKER_TYPE,
+            iou=IOU_THRESHOLD,
             verbose=False
         )
     else:
-        results = model(source, verbose=False)
+        results = model(
+            source,
+            iou=IOU_THRESHOLD,
+            verbose=False
+        )
     
     if not results or len(results) == 0:
         return None, None, None
