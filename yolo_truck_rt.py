@@ -5,20 +5,22 @@ import logging
 from datetime import datetime
 import re
 from config import (TEST_IMAGE_PATH, OUTPUT_IMAGE_PATH, TEST_VIDEO_PATH, OUTPUT_VIDEO_PATH, DIAGNOSTICS_PATH,
-                    INPUT_MODE, EXPECTED_COMPONENT_COUNTS, FRONT_EXPECTED_COMPONENTS, BACK_EXPECTED_COMPONENTS,
-                    TRACKER_TYPE, CAMERA_INDEX, CONSENSUS_WINDOW_SECONDS, IGNORE_PERIOD_SECONDS, SAVE_INTERVAL_SECONDS, IOU_THRESHOLD,
-                    SAVE_INTERMEDIATE_DIAGNOSTICS, DELETE_INT_DIAGNOSTICS, SAVE_CROPS, DELETE_SAVED_CROPS,
+                    INPUT_MODE, EXPECTED_COMPONENT_COUNTS, PAIRED_COMPONENTS, FRONT_EXPECTED_COMPONENTS, BACK_EXPECTED_COMPONENTS,
+                    TRACKER_TYPE, CAMERA_INDEX, COUNT_TO_DECIDE_CONSENSUS, IGNORE_PERIOD_SECONDS, DIAGNOSTIC_INTERVAL_SECONDS, IOU_THRESHOLD,
+                    WIPER_FRAMES_TO_COLLECT, WIPER_COLLECTION_INTERVAL_SECONDS, LIGHT_FRAMES_TO_COLLECT, LIGHT_COLLECTION_INTERVAL_SECONDS,
+                    SAVE_INTERMEDIATE_DIAGNOSTICS, DELETE_INT_DIAGNOSTICS, SAVE_CROPS, DELETE_SAVED_CROPS, MIN_SAMPLE_GAP_FRAMES,
                     BLUE, RED, ORANGE, GREEN, CYAN, RESET)
+
 from utility import (
     get_cached_yolo_model, get_available_classes, _extract_monthly_folder,
-    save_cropped_detections, cleanup_intermediate_diagnostics, cleanup_saved_crops
-)
+    save_cropped_detections, save_debug_crop, cleanup_intermediate_diagnostics, cleanup_saved_crops
+    )
 from diagnostic_history import DiagnosticHistory
 from parts_diagnostics import run_front_diagnostics, run_back_diagnostics
 
 # --- Logging Configuration ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Change from INFO or DEBUG to adjust verbosity
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -51,6 +53,119 @@ def extract_plate_crop(source_img, full_component_data, truck_face):
                 logger.warning("Invalid plate crop coordinates")
     return plate_crop
 
+# Assigns left/right labels based on truck's intrinsic orientation
+def assign_left_right_to_detections(component_data, component_name, image_width, truck_face):
+    """
+    Assign left/right labels to paired component detections based on truck's intrinsic orientation.
+    
+    Logic hierarchy:
+    - CASE 1 (2 detections): Compare center-x RELATIVE to each other (NO image center comparison)
+    - CASE 2 (1 detection): Fallback to image center line comparison
+    - CASE 3 (0 detections): Both sides return empty
+    
+    Truck orientation mapping (intrinsic, not image perspective):
+    - truck_front: truck's LEFT side appears on image RIGHT (center_x > image_center)
+    - truck_back: truck's LEFT side appears on image LEFT (center_x < image_center)
+    
+    Args:
+        component_data: Dict with 'confidences', 'boxes', 'track_ids' from YOLO
+        component_name: Original YOLO class name (e.g., "mirror")
+        image_width: Width of source image for middle-line fallback
+        truck_face: "truck_front", "truck_back", or "unknown"
+    
+    Returns:
+        tuple: (left_comp_data, right_comp_data) each with count 0 or 1
+    """
+    
+    # If not a paired component, return unchanged (caller handles single components)
+    if component_name not in PAIRED_COMPONENTS:
+        return component_data, None
+    
+    # Extract detections
+    confidences = component_data.get('confidences', [])
+    boxes = component_data.get('boxes', [])
+    track_ids = component_data.get('track_ids', [])
+    
+    # Initialize empty component structure
+    empty_comp = {"count": 0, "confidences": [], "track_ids": [], "boxes": []}
+    
+    # If no detections, return empty for both sides
+    if not confidences or len(boxes) == 0:
+        return empty_comp.copy(), empty_comp.copy()
+    
+    # Build list of detection dicts with center_x for spatial comparison
+    detections = []
+    for i, (conf, bbox, tid) in enumerate(zip(confidences, boxes, track_ids)):
+        x1, y1, x2, y2 = bbox
+        center_x = (x1 + x2) / 2
+        detections.append({
+            "conf": conf,
+            "bbox": list(bbox),  # Ensure mutable copy
+            "track_id": tid,
+            "center_x": center_x
+        })
+    
+    # Helper to build side-specific comp_data from a detection
+    def build_comp_data(det):
+        return {
+            "count": 1,
+            "confidences": [det["conf"]],
+            "track_ids": [det["track_id"]] if det["track_id"] is not None else [],
+            "boxes": [det["bbox"]]
+        }
+    
+    # CASE 1: Two detections - assign by RELATIVE x-position (user requirement: NO image center comparison)
+    if len(detections) == 2:
+        # Sort by center_x to identify leftmost and rightmost in IMAGE coordinates
+        # Lower center_x = appears on left of image, Higher center_x = appears on right of image
+        sorted_by_x = sorted(detections, key=lambda d: d["center_x"])
+        image_left_det = sorted_by_x[0]  # Lower x = appears on left of image
+        image_right_det = sorted_by_x[1]  # Higher x = appears on right of image
+        
+        # Map image position to truck's INTRINSIC side based on truck_face
+        if truck_face == "truck_front":
+            # Viewing front: truck's LEFT is on image RIGHT, truck's RIGHT is on image LEFT
+            truck_left_det = image_right_det
+            truck_right_det = image_left_det
+        elif truck_face == "truck_back":
+            # Viewing back: truck's LEFT is on image LEFT, truck's RIGHT is on image RIGHT
+            truck_left_det = image_left_det
+            truck_right_det = image_right_det
+        else:
+            # Unknown orientation: default to image-coordinate assignment
+            truck_left_det = image_left_det
+            truck_right_det = image_right_det
+        
+        return build_comp_data(truck_left_det), build_comp_data(truck_right_det)
+    
+    # CASE 2: One detection - assign by position relative to image middle line (fallback only)
+    elif len(detections) == 1:
+        det = detections[0]
+        image_center_x = image_width / 2
+        
+        # Determine which side of image the detection falls on
+        appears_on_image_left = det["center_x"] < image_center_x
+        
+        # Map to truck's intrinsic side
+        if truck_face == "truck_front":
+            # Front view: image-left = truck-right, image-right = truck-left
+            is_truck_left = not appears_on_image_left
+        elif truck_face == "truck_back":
+            # Back view: image-left = truck-left, image-right = truck-right
+            is_truck_left = appears_on_image_left
+        else:
+            # Unknown: default to image-coordinate interpretation
+            is_truck_left = appears_on_image_left
+        
+        if is_truck_left:
+            return build_comp_data(det), empty_comp.copy()
+        else:
+            return empty_comp.copy(), build_comp_data(det)
+    
+    # CASE 3: Fallback for unexpected counts (shouldn't happen after filtering)
+    else:
+        return empty_comp.copy(), empty_comp.copy()
+
 # --- Core Detection and Tracking Function ---
 def detect_or_track_objects(source, is_video=False, frame_id=0):
     """
@@ -60,7 +175,7 @@ def detect_or_track_objects(source, is_video=False, frame_id=0):
         source: Image path, video frame, or camera feed
         is_video (bool): True for video/camera processing (enables tracking), False for single image
         frame_id (int): Frame number for logging purposes (default: 0)
-    
+        
     Returns:
         tuple: (json_output, annotated_image, component_data) or (None, None, None) on failure
             - json_output: Dictionary containing truck face and component detection results
@@ -76,7 +191,8 @@ def detect_or_track_objects(source, is_video=False, frame_id=0):
             source,
             tracker=TRACKER_TYPE,
             iou=IOU_THRESHOLD,
-            verbose=False
+            verbose=False,
+            persist=True
         )
     else:
         results = model(
@@ -90,6 +206,11 @@ def detect_or_track_objects(source, is_video=False, frame_id=0):
         
     result = results[0]
     annotated_result = result.plot()
+
+    # # Debug logging for track IDs to verify tracker continuity
+    # if is_video and hasattr(result.boxes, 'id') and result.boxes.id is not None:
+    #     track_ids = [int(id) for id in result.boxes.id]
+    #     logger.info(f"Frame {frame_id}: Track IDs = {track_ids}")
 
     # --- COLLECT DETECTIONS (with track IDs if available) ---
     valid_detections = []
@@ -155,6 +276,37 @@ def detect_or_track_objects(source, is_video=False, frame_id=0):
                 component_data[comp]['boxes'] = [b for _, b, _ in kept]
                 component_data[comp]['track_ids'] = [t for _, _, t in kept]
 
+    # --- Filter by confidence FIRST (above), THEN assign sides (here) ---
+    # Get image dimensions for middle-line fallback in spatial assignment
+    if hasattr(source, 'shape'):
+        # source is a numpy array (video frame or loaded image)
+        img_h, img_w = source.shape[:2]
+    else:
+        # Fallback for other source types (use reasonable defaults)
+        img_w, img_h = 1920, 1080
+    
+    # Process each component that might be paired
+    for comp_name in list(component_data.keys()):
+        if comp_name in PAIRED_COMPONENTS:
+            # Get filtered component data (already limited by EXPECTED_COMPONENT_COUNTS above)
+            orig_comp_data = component_data[comp_name]
+            
+            # Assign left/right using spatial analysis (NO caching, always compute)
+            left_data, right_data = assign_left_right_to_detections(
+                orig_comp_data, 
+                comp_name, 
+                img_w, 
+                truck_face
+            )
+            
+            # Get side-specific keys from config
+            left_key, right_key = PAIRED_COMPONENTS[comp_name]
+            
+            # Replace generic key with side-specific keys in component_data
+            component_data[left_key] = left_data
+            component_data[right_key] = right_data
+            del component_data[comp_name]  # Remove generic key to avoid duplication
+
     # --- BUILD JSON OUTPUT ---
     json_output = {
         "truck_face": truck_face,
@@ -162,9 +314,21 @@ def detect_or_track_objects(source, is_video=False, frame_id=0):
     }
 
     for comp in expected_components:
-        count = len(component_data.get(comp, {}).get('confidences', []))
-        confs = component_data.get(comp, {}).get('confidences', [])
-        track_ids = component_data.get(comp, {}).get('track_ids', [])
+        comp_raw = component_data.get(comp, {})
+
+        # Safe access with fallback
+        confs = comp_raw.get('confidences', [])
+        boxes = comp_raw.get('boxes', [])
+
+        # Ensure confs is a list (defensive programming)
+        if not isinstance(confs, list):
+            confs = [confs] if confs is not None else []
+        if not isinstance(boxes, list):
+            boxes = [boxes] if boxes is not None else [] 
+
+        track_ids = comp_raw.get('track_ids', [])
+        count = comp_raw.get('count', len(confs))
+
         json_output["truck_components"][comp] = {
             "count": count,
             "confidence": [round(c, 2) for c in confs],
@@ -190,7 +354,9 @@ def process_diagnostics_and_save(
     frame_id=0,
     save_to_disk=True,
     diagnosis_timestamp: str = None,
-    session_folder_name: str = None
+    session_folder_name: str = None,
+    movement_tracker=None,
+    image_width=None 
 ):
     """
     Process diagnostics and save results for both image and video modes.
@@ -206,6 +372,8 @@ def process_diagnostics_and_save(
         save_to_disk (bool): If False, processes diagnostics but skips disk write (for intermediate frames)
         diagnosis_timestamp (str): Session start timestamp in "YYYY-MM-DD HH:MM:SS" format
         session_folder_name (str): Session folder name like "int_diagnostics_20260206_143522_123"
+        movement_tracker: Optional DiagnosticHistory instance for wiper movement tracking
+        image_width: Image width for relative movement threshold calculation
 
     Returns:
         tuple: (diagnostics_log, enhanced_components)
@@ -218,11 +386,19 @@ def process_diagnostics_and_save(
 
     if truck_face == "truck_back":
         logger.info("Running back diagnostics")
-        diag_messages, plate_num = run_back_diagnostics(components, plate_crop)
+        diag_messages, plate_num = run_back_diagnostics(
+            components, plate_crop, 
+            movement_tracker=movement_tracker,
+            image_width=image_width
+        )
         diagnostics_log = diag_messages
     elif truck_face == "truck_front":
         logger.info("Running front diagnostics")
-        diag_messages, plate_num = run_front_diagnostics(components, plate_crop)
+        diag_messages, plate_num = run_front_diagnostics(
+            components, plate_crop,
+            movement_tracker=movement_tracker,
+            image_width=image_width
+        )
         diagnostics_log = diag_messages
     else:
         msg = "truck face not detected — no diagnostics performed"
@@ -244,7 +420,7 @@ def process_diagnostics_and_save(
     for msg in diagnostics_log:
         logger.info(msg)
 
-    # --- Build enhanced truck_components using RAW data ---
+    # --- Build enhanced truck_components using components dict (not full_component_data) ---
     enhanced_components = {}
     expected_components = []
     if truck_face == "truck_front":
@@ -253,15 +429,35 @@ def process_diagnostics_and_save(
         expected_components = BACK_EXPECTED_COMPONENTS
 
     for comp in expected_components:
+        # Get raw detection data from full_component_data
         raw_data = full_component_data.get(comp, {'confidences': [], 'boxes': [], 'track_ids': []})
+        
+        # Safe access with fallback to empty list - ensures confidence is always iterable
+        confs = raw_data.get('confidences', [])
+        # Ensure confs is a list (defensive: handle case where it might be a float)
+        if not isinstance(confs, list):
+            confs = [confs] if confs is not None else []
+
         comp_entry = {
-            "count": len(raw_data['confidences']),
-            "confidence": raw_data['confidences']
+            "count": raw_data.get('count', len(confs)),
+            "confidence": confs
         }
         # Include track_ids if available (for consistency)
         if 'track_ids' in raw_data and raw_data['track_ids']:
             comp_entry["track_ids"] = [tid for tid in raw_data['track_ids'] if tid is not None]
+
+        comp_from_components = components.get(comp, {})
+
+        # Include wiper_moving status if available (for wipers)
+        if 'wiper_moving' in comp_from_components:
+            comp_entry["wiper_moving"] = comp_from_components["wiper_moving"]
         
+        # Include light_working status if available (for front lights)
+        if 'light_working' in comp_from_components:
+            comp_entry["light_working"] = comp_from_components["light_working"]
+        if 'light_sections' in comp_from_components:
+            comp_entry["light_sections"] = comp_from_components["light_sections"]
+                               
         # Store OCR confidence separately for plate_number
         if comp == 'plate_number' and plate_num is not None:
             comp_entry["number"] = plate_num
@@ -370,7 +566,8 @@ def save_final_consensus_diagnostics(
         "truck_components": consensus_components,
         "diagnostics_ok": diagnostics_ok,
         "diagnostics_ng": diagnostics_ng,
-        "consensus_window_seconds": CONSENSUS_WINDOW_SECONDS,
+        "count_to_decide_consensus": COUNT_TO_DECIDE_CONSENSUS,
+        "diagnostic_interval_seconds": DIAGNOSTIC_INTERVAL_SECONDS,
         "ignore_period_seconds": IGNORE_PERIOD_SECONDS,
         "input_mode": INPUT_MODE
     }
@@ -436,7 +633,9 @@ def process_single_image(
         is_video=False,
         save_to_disk=True,
         diagnosis_timestamp=diagnosis_timestamp,
-        session_folder_name=session_folder_name
+        session_folder_name=session_folder_name,
+        movement_tracker=None,
+        image_width=None
     )
 
     # Optional cropped detections
@@ -486,9 +685,9 @@ def process_video_source(
     source_path: str | int, 
     is_camera: bool = False, 
     camera_index: int = 0,
-    consensus_window: int = CONSENSUS_WINDOW_SECONDS,
-    ignore_period: int = IGNORE_PERIOD_SECONDS,
-    save_interval: float = SAVE_INTERVAL_SECONDS,
+    count_to_decide_consensus: int = None,
+    ignore_period: int = None,
+    diagnostic_interval: float = None,
     session_folder_name: str = None,
     diagnosis_timestamp: str = None,
     parts_session_folder: str = None
@@ -500,9 +699,9 @@ def process_video_source(
         source_path: Video file path (str) or camera index (int) if is_camera=True
         is_camera: True for live camera feed, False for video file processing
         camera_index: Camera device index (only used if is_camera=True)
-        consensus_window: Duration in seconds for temporal consensus window (default: 18)
-        ignore_period: Duration in seconds to ignore at start of stream for stabilization (default: 1)
-        save_interval: Interval in seconds between diagnostic saves during processing (default: 2.5)
+        count_to_decide_consensus: Maximum diagnostic samples to collect (default: 7)
+        ignore_period: Duration in seconds to ignore at start for stabilization (default: 1)
+        diagnostic_interval: Real-time interval between diagnostics in seconds (default: 3)
         session_folder_name: Session folder name like "int_diagnostics_20260206_143522_123"
         diagnosis_timestamp: Session start timestamp in "YYYY-MM-DD HH:MM:SS" format
         parts_session_folder: Parts session folder name like "parts_20260206_143522_123"
@@ -513,6 +712,13 @@ def process_video_source(
                 (diagnostics, truck_face, components, ok_list, ng_list)
             - success: True if stream processed successfully, False on failure
     """
+    if count_to_decide_consensus is None:
+        count_to_decide_consensus = COUNT_TO_DECIDE_CONSENSUS
+    if diagnostic_interval is None:
+        diagnostic_interval = DIAGNOSTIC_INTERVAL_SECONDS
+    if ignore_period is None:
+        ignore_period = IGNORE_PERIOD_SECONDS
+
     # Initialize video capture
     cap = cv2.VideoCapture(camera_index if is_camera else source_path)
     source_desc = f"camera device {camera_index}" if is_camera else f"video file: {source_path}"
@@ -538,14 +744,23 @@ def process_video_source(
         
         # Initialize diagnostic history tracker with x sec consensus window and y sec ignore period
         diagnostic_history = DiagnosticHistory(
-            consensus_window_seconds=consensus_window,
+            count_to_decide_consensus=count_to_decide_consensus,
             ignore_period_seconds=ignore_period
         )
         processing_start_time = datetime.now().timestamp()
         diagnostic_history.set_start_time(processing_start_time)
-        
+
+        # Count-based diagnostic collection tracking
+        diagnostic_count = 0
+        last_diagnostic_time = datetime.now()
+        last_diagnostic_frame = 0
+
+        #  Track debug crop collection per diagnostic sample for lights and wipers
+        # Format: {track_id: {"count": 0, "last_save_time": None, "sample_id": None}}
+        light_crop_tracking = {}
+        wiper_crop_tracking = {}
+
         # Processing loop
-        last_save_time = datetime.now()
         frame_count = 0
         last_annotated_frame = None    
 
@@ -558,7 +773,7 @@ def process_video_source(
             frame_count += 1
             current_time = datetime.now()
             
-            # Detect/track objects
+            # Detect/track objects (every frame)
             detected_json, annotated_frame, full_component_data = detect_or_track_objects(
                 frame, is_video=True, frame_id=frame_count
             )
@@ -568,50 +783,214 @@ def process_video_source(
                 last_annotated_frame = annotated_frame
             else:
                 last_annotated_frame = annotated_frame
-            
-            # Run diagnostics every SAVE_INTERVAL_SECONDS
-            if (current_time - last_save_time).total_seconds() >= save_interval:
-                last_save_time = current_time
-                
-                # Extract plate crop
-                plate_crop = extract_plate_crop(frame, full_component_data, detected_json["truck_face"])
-                source_info = {"frame_id": frame_count, "timestamp": current_time.isoformat()}
 
-                # Process diagnostics but only save if debugging
-                diagnostics_log, enhanced_components = process_diagnostics_and_save(
-                    detected_json["truck_face"],
-                    detected_json["truck_components"],
-                    full_component_data,
-                    plate_crop,
-                    source_info,
-                    is_video=True,
-                    frame_id=frame_count,
-                    save_to_disk=SAVE_INTERMEDIATE_DIAGNOSTICS,
-                    diagnosis_timestamp=diagnosis_timestamp,
-                    session_folder_name=session_folder_name
-                )
-                
-                # Save cropped detections if enabled
-                if SAVE_CROPS:
-                    save_cropped_detections(
-                        frame, 
-                        full_component_data, 
+            # Track wiper positions for movement verification
+            if detected_json is not None and full_component_data is not None:
+                for side in ["left", "right"]:
+                    comp_key = f"{side}_wiper"
+                    if full_component_data is not None and comp_key in full_component_data:
+                        comp_data = full_component_data[comp_key]
+                        # Only track if detected with valid track_id and bbox
+                        if comp_data.get("count", 0) == 1 and comp_data.get("track_ids") and comp_data.get("boxes"):
+                            track_id = comp_data["track_ids"][0]
+                            if track_id is not None:
+                                # Get bbox and extract coordinates
+                                bbox = comp_data["boxes"][0]  # boxes is list of lists: [[x1,y1,x2,y2]]
+                                x1, y1, x2, y2 = [int(coord) for coord in bbox]
+                                center_x = (bbox[0] + bbox[2]) / 2
+                  
+                                # Add observation to diagnostic history
+                                diagnostic_history.add_wiper_observation(
+                                    track_id=track_id,
+                                    side=side,
+                                    timestamp=current_time.timestamp(),
+                                    center_x=center_x,
+                                    image_width=frame_width
+                                )
+                                logger.debug(f"Tracked {side} wiper (track_id={track_id}) at x={center_x:.1f}px, ")
+
+                                # Save debug crop ONLY at analysis collection intervals, up to limit per diagnostic sample
+                                time_since_start = (current_time - datetime.fromtimestamp(processing_start_time)).total_seconds()
+                                if time_since_start >= ignore_period and diagnostic_count < count_to_decide_consensus:
+                                    current_ts = current_time.timestamp()
+                                    
+                                    # Initialize tracking for this track_id if needed
+                                    if track_id not in wiper_crop_tracking:
+                                        wiper_crop_tracking[track_id] = {"count": 0, "last_save_time": None, "sample_id": None}
+                                    
+                                    tracking = wiper_crop_tracking[track_id]
+                                    
+                                    # Reset count if we've moved to a new diagnostic sample
+                                    if tracking["sample_id"] != diagnostic_count:
+                                        tracking["count"] = 0
+                                        tracking["last_save_time"] = None
+                                        tracking["sample_id"] = diagnostic_count
+                                    
+                                    # Save crop if: under limit for this sample (wipers: save every detected frame up to limit)
+                                    # For wipers, we save every detected frame up to WIPER_MIN_FRAMES_FOR_MOVEMENT per sample
+                                    if diagnostic_count >= 1 and (tracking["last_save_time"] is None or 
+                                        current_ts - tracking["last_save_time"] >= WIPER_COLLECTION_INTERVAL_SECONDS) and \
+                                       tracking["count"] < WIPER_FRAMES_TO_COLLECT:
+                                        # Crop wiper region for debug saving
+                                        h, w = frame.shape[:2]
+                                        x1_clamped, y1_clamped = max(0, x1), max(0, y1)
+                                        x2_clamped, y2_clamped = min(w, x2), min(h, y2)
+                                        if x2_clamped > x1_clamped and y2_clamped > y1_clamped:
+                                            wiper_crop = frame[y1_clamped:y2_clamped, x1_clamped:x2_clamped]
+                                            save_debug_crop(
+                                                crop_image=wiper_crop,
+                                                side=side,
+                                                component="wiper",
+                                                track_id=track_id,
+                                                frame_id=frame_count,
+                                                sample_count=diagnostic_count,  # Current diagnostic sample number (1-7)
+                                                diagnosis_timestamp=diagnosis_timestamp,
+                                                parts_session_folder=parts_session_folder,
+                                                crop_type="wiper"
+                                            )
+                                            tracking["count"] += 1
+                                            tracking["last_save_time"] = current_ts
+
+            # Track light crops for brightness change verification (every frame)
+            if detected_json is not None and full_component_data is not None:
+                for side in ["left", "right"]:
+                    comp_key = f"{side}_light_front"
+                    if comp_key in full_component_data:
+                        comp_data = full_component_data[comp_key]
+                        if comp_data.get("count", 0) == 1 and comp_data.get("track_ids") and comp_data.get("boxes"):
+                            track_id = comp_data["track_ids"][0]
+                            if track_id is not None:
+                                # Get bbox and extract coordinates
+                                bbox = comp_data["boxes"][0]  # boxes is list of lists: [[x1,y1,x2,y2]]
+                                x1, y1, x2, y2 = [int(coord) for coord in bbox]
+                                
+                                # Crop light region for tracking and debug saving (at diagnostic samples only)
+                                h, w = frame.shape[:2]
+                                x1, y1 = max(0, x1), max(0, y1)
+                                x2, y2 = min(w, x2), min(h, y2)
+                                
+                                if x2 > x1 and y2 > y1:
+                                    crop = frame[y1:y2, x1:x2]
+                                    
+                                    # Add observation to diagnostic history
+                                    diagnostic_history.add_light_observation(
+                                        track_id=track_id,
+                                        side=side,
+                                        timestamp=current_time.timestamp(),
+                                        crop_image=crop
+                                    )
+
+                                    light_history_key = f"{side}_light_front_{track_id}"
+                                    crop_count = len(diagnostic_history.light_history.get(light_history_key, {}).get('crops', []))
+                                    logger.debug(
+                                        f"Light crop collected: {side} (track_id={track_id}), "
+                                        f"total_crops_in_history={crop_count}, crop_shape={crop.shape}"
+                                    )
+
+                                    # Save debug crop ONLY at analysis collection intervals, up to limit per diagnostic sample
+                                    time_since_start = (current_time - datetime.fromtimestamp(processing_start_time)).total_seconds()
+                                    if time_since_start >= ignore_period and diagnostic_count < count_to_decide_consensus:
+                                        current_ts = current_time.timestamp()
+                                        
+                                        # Initialize tracking for this track_id if needed
+                                        if track_id not in light_crop_tracking:
+                                            light_crop_tracking[track_id] = {"count": 0, "last_save_time": None, "sample_id": None}
+                                        
+                                        tracking = light_crop_tracking[track_id]
+                                        
+                                        # Reset count if we've moved to a new diagnostic sample
+                                        if tracking["sample_id"] != diagnostic_count:
+                                            tracking["count"] = 0
+                                            tracking["last_save_time"] = None
+                                            tracking["sample_id"] = diagnostic_count
+                                        
+                                        # Save crop if: enough time passed AND under limit for this sample
+                                        if diagnostic_count >= 1 and (tracking["last_save_time"] is None or 
+                                            current_ts - tracking["last_save_time"] >= LIGHT_COLLECTION_INTERVAL_SECONDS) and \
+                                           tracking["count"] < LIGHT_FRAMES_TO_COLLECT:
+                                            
+                                            save_debug_crop(
+                                                crop_image=crop,
+                                                side=side,
+                                                component="light_front",
+                                                track_id=track_id,
+                                                frame_id=frame_count,
+                                                sample_count=diagnostic_count,  # Current diagnostic sample number (1-7)
+                                                diagnosis_timestamp=diagnosis_timestamp,
+                                                parts_session_folder=parts_session_folder,
+                                                crop_type="light"
+                                            )
+                                            tracking["count"] += 1
+                                            tracking["last_save_time"] = current_ts
+
+            # Collect diagnostics at real-time intervals until count reached
+            time_since_last_diagnostic = (current_time - last_diagnostic_time).total_seconds()
+            if time_since_last_diagnostic >= diagnostic_interval and diagnostic_count < count_to_decide_consensus:
+                # Check if we're past ignore period
+                time_since_start = (current_time - datetime.fromtimestamp(processing_start_time)).total_seconds()
+                if time_since_start >= ignore_period:
+                    
+                    # Enforce minimum frame gap between samples
+                    # This ensures each sample has enough frames for crop collection (6 frames × 0.5s = 3 seconds)
+                    frames_since_last_sample = frame_count - last_diagnostic_frame if 'last_diagnostic_frame' in locals() else 0
+                    if frames_since_last_sample < MIN_SAMPLE_GAP_FRAMES:
+                        # Skip - not enough frames since last sample for crop collection
+                        continue    
+                    
+                    diagnostic_count += 1
+                    last_diagnostic_time = current_time
+                    last_diagnostic_frame = frame_count
+
+                    # Calculate elapsed time for logging
+                    elapsed_time = time_since_start
+                    logger.info(f"Diagnostic sample {diagnostic_count}/{count_to_decide_consensus} collected (frame {frame_count}, t={elapsed_time:.1f}s)")
+                                    
+                    # Extract plate crop
+                    plate_crop = extract_plate_crop(frame, full_component_data, detected_json["truck_face"])
+                    source_info = {"frame_id": frame_count, "timestamp": current_time.isoformat()}
+
+                    # Process diagnostics but only save if debugging
+                    diagnostics_log, enhanced_components = process_diagnostics_and_save(
+                        detected_json["truck_face"],
+                        detected_json["truck_components"],
+                        full_component_data,
+                        plate_crop,
+                        source_info,
+                        is_video=True,
                         frame_id=frame_count,
+                        save_to_disk=SAVE_INTERMEDIATE_DIAGNOSTICS,
                         diagnosis_timestamp=diagnosis_timestamp,
-                        parts_session_folder=parts_session_folder
+                        session_folder_name=session_folder_name,
+                        movement_tracker=diagnostic_history,
+                        image_width=frame_width
                     )
-                
-                # Add to diagnostic history with current timestamp
-                diagnostic_entry = {
-                    "frame_id": frame_count,
-                    "truck_face": detected_json["truck_face"],
-                    "truck_components": enhanced_components,
-                    "timestamp": current_time.isoformat(),
-                    "diagnostics": diagnostics_log
-                }
-                diagnostic_history.add_diagnostics(current_time.timestamp(), diagnostic_entry)
 
-                       # Write frame and display (camera only)
+                    # Save cropped detections if enabled
+                    if SAVE_CROPS:
+                        save_cropped_detections(
+                            frame, 
+                            full_component_data, 
+                            frame_id=frame_count,
+                            diagnosis_timestamp=diagnosis_timestamp,
+                            parts_session_folder=parts_session_folder
+                        )
+                
+                    # Add to diagnostic history with current timestamp
+                    diagnostic_entry = {
+                        "frame_id": frame_count,
+                        "truck_face": detected_json["truck_face"],
+                        "truck_components": enhanced_components,
+                        "timestamp": current_time.isoformat(),
+                        "diagnostics": diagnostics_log
+                    }
+                    diagnostic_history.add_diagnostics(current_time.timestamp(), diagnostic_entry)
+
+                    # Stop video processing after reaching target diagnostic count
+                    if diagnostic_count >= count_to_decide_consensus:
+                        logger.info(f"Maximum diagnostic count reached ({diagnostic_count}/{count_to_decide_consensus}). Stopping video processing.")
+                        break
+
+            # Write frame to output video (every frame)
             if last_annotated_frame is not None:
                 video_writer.write(last_annotated_frame)
             
@@ -750,9 +1129,9 @@ def main():
                 source_path=CAMERA_INDEX if INPUT_MODE == "camera" else TEST_VIDEO_PATH,
                 is_camera=(INPUT_MODE == "camera"),
                 camera_index=CAMERA_INDEX,
-                consensus_window=CONSENSUS_WINDOW_SECONDS,
+                count_to_decide_consensus=COUNT_TO_DECIDE_CONSENSUS,
                 ignore_period=IGNORE_PERIOD_SECONDS,
-                save_interval=SAVE_INTERVAL_SECONDS,
+                diagnostic_interval=DIAGNOSTIC_INTERVAL_SECONDS,
                 session_folder_name=session_folder_name,
                 diagnosis_timestamp=diagnosis_timestamp,
                 parts_session_folder=parts_session_folder
@@ -762,7 +1141,7 @@ def main():
             if success and consensus_result[0] is not None:
                 consensus_diagnostics, truck_face, consensus_components, diagnostics_ok, diagnostics_ng = consensus_result
 
-                # Split diagnostics into OK and NG
+                # Split diagnostics into OK and NG (⚠️ counts as failing per user requirement)
                 diagnostics_ok = [m for m in consensus_diagnostics if m.startswith("✅")]
                 diagnostics_ng = [m for m in consensus_diagnostics if m.startswith(("❌", "⚠️"))]
 
