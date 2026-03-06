@@ -7,7 +7,7 @@ import torch
 import os
 from PIL import Image
 import tempfile
-from config import DIAGNOSTIC_THRESHOLD, EXPECTED_COMPONENT_COUNTS
+from config import DIAGNOSTIC_THRESHOLD, EXPECTED_COMPONENT_COUNTS, WIPER_FRAMES_TO_COLLECT, WIPER_COLLECTION_INTERVAL_SECONDS, WIPER_MIN_FRAMES_FOR_ANALYSIS, LIGHT_MIN_FRAMES_FOR_ANALYSIS
 from utility import get_cached_vlm_model
 from qwen_vl_utils import process_vision_info
 
@@ -185,41 +185,188 @@ def run_vlm_ocr_on_plate(plate_image):
         return None
 
 # --- Modular Component Diagnostic Functions ---
-def check_mirrors(comp_data):
-    if comp_data["count"] < EXPECTED_COMPONENT_COUNTS['mirror'] or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
-        return "❌ mirrors: missing/broken"
+def check_left_mirror(comp_data):
+    """Check left mirror (single component, count should be 0 or 1)."""
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        return "❌ left mirror: missing/broken"
     else:
-        return "✅ mirrors: ok"
+        return "✅ left mirror: ok"
 
-def check_front_lights(comp_data):
-    if comp_data["count"] < EXPECTED_COMPONENT_COUNTS['light_front'] or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
-        return "❌ front lights: missing/broken"
+def check_right_mirror(comp_data):
+    """Check right mirror (single component, count should be 0 or 1)."""
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        return "❌ right mirror: missing/broken"
     else:
-        return "✅ front lights: ok"
+        return "✅ right mirror: ok"
 
-def check_wipers(comp_data):
-    if comp_data["count"] < EXPECTED_COMPONENT_COUNTS['wiper'] or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
-        return "❌ wipers: missing/broken"
+def check_left_light_front(comp_data, movement_tracker=None, image_width=None):
+    # Original detection check (must pass first)
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        comp_data["light_working"] = False  # Store FAIL for consensus
+        comp_data["light_sections"] = 0     # Store section count for consensus
+        return "❌ left front light: missing/broken"
+    
+    # Brightness change check (only if tracker provided and video mode)
+    if movement_tracker and comp_data.get("track_ids"):
+        track_id = comp_data["track_ids"][0]
+        status, section_count, total_grids, section_grid_counts, section_brightness_values, frame_count = movement_tracker.get_light_working_sections(track_id, "left")
+        
+        # Log frame count to diagnose why sections aren't showing
+        logger.debug(f"DEBUG check_left_light_front: track_id={track_id}, frame_count={frame_count}, LIGHT_MIN_FRAMES_FOR_ANALYSIS={LIGHT_MIN_FRAMES_FOR_ANALYSIS}, working={status}, section_counts={section_grid_counts}")
+
+        if frame_count >= LIGHT_MIN_FRAMES_FOR_ANALYSIS:
+            # Sufficient frames for analysis
+            if status == "broken":
+                # ⚠️ Case 2a: Detected but not lighting (functional analysis failed)
+                comp_data["light_working"] = False  # Inline storage for consensus
+                comp_data["light_sections"] = 0     # Store section count for consensus
+                return f"⚠️ left front light: detected but not lighting (0 sections working)"
+            elif status == "lighting":
+                # ✅ Case 3: Detected and lighting (functional analysis passed)
+                comp_data["light_working"] = True  # Inline storage for consensus
+                comp_data["light_sections"] = section_count  # Store section count for consensus
+                # FULL diagnostic message with grid/brightness details for intermediate diagnostics
+                grid_counts_str = ", ".join([str(count) for count in section_grid_counts])
+                brightness_str = ", ".join([f"{v:.1f}px" for v in section_brightness_values])
+                return f"✅ left front light: ok, with {section_count} sections working (grid sizes: {grid_counts_str} - brightness changes: {brightness_str})"
+            # status == "insufficient_data" → fall through to detection-only pass
+        # If insufficient frames, fall through to detection-only pass
+    
+    # ⚠️ Case 2b: Insufficient data for functional analysis (no tracker or insufficient frames)
+    comp_data["light_working"] = None  # Inline storage for consensus (fallback to YOLO)
+    comp_data["light_sections"] = None  # 🔧 NEW: No section data available
+    return "✅ left front light: ok"
+
+def check_right_light_front(comp_data, movement_tracker=None, image_width=None):
+    # Original detection check (must pass first)
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        comp_data["light_working"] = False  # Store FAIL for consensus
+        comp_data["light_sections"] = 0     # Store section count for consensus
+        return "❌ right front light: missing/broken"
+    
+    # Brightness change check (only if tracker provided and video mode)
+    if movement_tracker and comp_data.get("track_ids"):
+        track_id = comp_data["track_ids"][0]
+        status, section_count, total_grids, section_grid_counts, section_brightness_values, frame_count = movement_tracker.get_light_working_sections(track_id, "right")
+        
+        # Log frame count to diagnose why sections aren't showing
+        logger.debug(f"DEBUG check_right_light_front: track_id={track_id}, frame_count={frame_count}, LIGHT_MIN_FRAMES_FOR_ANALYSIS={LIGHT_MIN_FRAMES_FOR_ANALYSIS}, working={status}, section_counts={section_grid_counts}")
+
+        if frame_count >= LIGHT_MIN_FRAMES_FOR_ANALYSIS:
+            # Sufficient frames for analysis
+            if status == "broken":
+                # ⚠️ Case 2a: Detected but not lighting (functional analysis failed)
+                comp_data["light_working"] = False  # Inline storage for consensus
+                comp_data["light_sections"] = 0     # Store section count for consensus
+                return f"⚠️ right front light: detected but not lighting (0 sections working)"
+            elif status == "lighting":
+                # ✅ Case 3: Detected and lighting (functional analysis passed)
+                comp_data["light_working"] = True  # Inline storage for consensus
+                comp_data["light_sections"] = section_count  # Store section count for consensus
+                # FULL diagnostic message with grid/brightness details for intermediate diagnostics
+                grid_counts_str = ", ".join([str(count) for count in section_grid_counts])
+                brightness_str = ", ".join([f"{v:.1f}px" for v in section_brightness_values])
+                return f"✅ right front light: ok, with {section_count} sections working (grid sizes: {grid_counts_str} - brightness changes: {brightness_str})"
+            # status == "insufficient_data" → fall through to detection-only pass
+        # If insufficient frames, fall through to detection-only pass
+    
+    # ⚠️ Case 2b: Insufficient data for functional analysis (no tracker or insufficient frames)
+    comp_data["light_working"] = None  # Inline storage for consensus (fallback to YOLO)
+    comp_data["light_sections"] = None  # No section data available
+    return "✅ right front light: ok"
+
+def check_left_wiper(comp_data, movement_tracker=None, image_width=None):
+    # Original detection check (must pass first)
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        comp_data["wiper_moving"] = False  # Store FAIL for consensus
+        return "❌ left wiper: missing/broken"
+    
+    # Movement check (only if tracker provided and video mode)
+    if movement_tracker and image_width and comp_data.get("track_ids"):
+        track_id = comp_data["track_ids"][0]
+        status, sweep_range, threshold, frame_count = movement_tracker.get_wiper_movement_status(track_id, "left")
+        
+        # Log frame count to diagnose why movement isn't showing
+        logger.debug(f"DEBUG check_left_wiper: track_id={track_id}, frame_count={frame_count}, WIPER_MIN_FRAMES_FOR_ANALYSIS={WIPER_MIN_FRAMES_FOR_ANALYSIS}, status={status}, sweep_range={sweep_range:.1f}px, threshold={threshold:.1f}px")
+        
+        if frame_count >= WIPER_MIN_FRAMES_FOR_ANALYSIS:
+            # Sufficient frames for analysis
+            if status == "stationary":
+                # ⚠️ Case 2a: Detected but stationary (functional analysis failed)
+                comp_data["wiper_moving"] = False  # Inline storage for consensus
+                return f"⚠️ left wiper: detected but not moving (sweep={sweep_range:.1f}px, threshold={threshold:.1f}px)"
+            elif status == "moving":
+                # ✅ Case 3: Detected and moving (functional analysis passed)
+                comp_data["wiper_moving"] = True  # Inline storage for consensus
+                return f"✅ left wiper: ok, with sweep_range: {sweep_range:.1f}px"
+            # status == "insufficient_data" → fall through to detection-only pass
+        # If insufficient frames, fall through to detection-only pass
+    
+    # ⚠️ Case 2b: Insufficient data for functional analysis (no tracker or insufficient frames)
+    comp_data["wiper_moving"] = None  # Inline storage for consensus (fallback to YOLO)
+    return "✅ left wiper: ok"
+
+def check_right_wiper(comp_data, movement_tracker=None, image_width=None):
+    # Original detection check (must pass first)
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        comp_data["wiper_moving"] = False  # Store FAIL for consensus
+        return "❌ right wiper: missing/broken"
+    
+    # Movement check (only if tracker provided and video mode)
+    if movement_tracker and image_width and comp_data.get("track_ids"):
+        track_id = comp_data["track_ids"][0]
+        status, sweep_range, threshold, frame_count = movement_tracker.get_wiper_movement_status(track_id, "right")
+        
+        # Log frame count to diagnose why movement isn't showing
+        logger.debug(f"DEBUG check_right_wiper: track_id={track_id}, frame_count={frame_count}, WIPER_MIN_FRAMES_FOR_ANALYSIS={WIPER_MIN_FRAMES_FOR_ANALYSIS}, status={status}, sweep_range={sweep_range:.1f}px, threshold={threshold:.1f}px")
+
+        if frame_count >= WIPER_MIN_FRAMES_FOR_ANALYSIS:
+            # Sufficient frames for analysis
+            if status == "stationary":
+                # ⚠️ Case 2a: Detected but stationary (functional analysis failed)
+                comp_data["wiper_moving"] = False  # Inline storage for consensus
+                return f"⚠️ right wiper: detected but not moving (sweep={sweep_range:.1f}px, threshold={threshold:.1f}px)"
+            elif status == "moving":
+                # ✅ Case 3: Detected and moving (functional analysis passed)
+                comp_data["wiper_moving"] = True  # Inline storage for consensus
+                return f"✅ right wiper: ok, with sweep_range: {sweep_range:.1f}px"
+            # status == "insufficient_data" → fall through to detection-only pass
+        # If insufficient frames, fall through to detection-only pass
+    
+    # ⚠️ Case 2b: Insufficient data for functional analysis (no tracker or insufficient frames)
+    comp_data["wiper_moving"] = None  # Inline storage for consensus (fallback to YOLO)
+    return "✅ right wiper: ok"
+
+def check_left_light_back(comp_data):
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        return "❌ left back light: missing/broken"
     else:
-        return "✅ wipers: ok"
+        return "✅ left back light: ok"
 
+def check_right_light_back(comp_data):
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        return "❌ right back light: missing/broken"
+    else:
+        return "✅ right back light: ok"
+
+def check_left_stand(comp_data):
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        return "❌ left stand: missing/broken"
+    else:
+        return "✅ left stand: ok"
+
+def check_right_stand(comp_data):
+    if comp_data["count"] < 1 or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
+        return "❌ right stand: missing/broken"
+    else:
+        return "✅ right stand: ok"
+
+# Keep single-component functions UNCHANGED (not affected by new requirements)
 def check_mirror_top(comp_data):
     if comp_data["count"] >= EXPECTED_COMPONENT_COUNTS['mirror_top'] and all(c >= DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
         return "✅ top mirror: ok"
     else:
         return "❌ top mirror: missing/broken"
-
-def check_back_lights(comp_data):
-    if comp_data["count"] < EXPECTED_COMPONENT_COUNTS['light_back'] or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
-        return "❌ back lights: missing/broken"
-    else:
-        return "✅ back lights: ok"
-
-def check_stands(comp_data):
-    if comp_data["count"] < EXPECTED_COMPONENT_COUNTS['stand'] or any(c < DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
-        return "❌ stands: missing/broken"
-    else:
-        return "✅ stands: ok"
 
 def check_carrier(comp_data):
     if comp_data["count"] >= EXPECTED_COMPONENT_COUNTS['carrier'] and all(c >= DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
@@ -234,9 +381,14 @@ def check_lift(comp_data):
         return "❌ lift: missing/broken"
 
 def check_plate_number(comp_data, plate_image=None, reader=None):
+    # Original detection check (must pass first)
     if comp_data["count"] < EXPECTED_COMPONENT_COUNTS['plate_number'] or not all(c >= DIAGNOSTIC_THRESHOLD for c in comp_data["confidence"]):
         return "❌ plate number: missing or obscured", None
 
+    # Log confidence for debugging OCR failures (should not be too low if we're here)
+    logger.debug(f"Plate number detected with confidence {comp_data['confidence']}, proceeding to OCR check")
+
+    # Plate number check (with OCR) - only if image provided (video mode)
     if plate_image is not None:
         extracted = run_vlm_ocr_on_plate(plate_image)
         if extracted:
@@ -247,25 +399,56 @@ def check_plate_number(comp_data, plate_image=None, reader=None):
         return "⚠️ plate number: visible but could not be read", None
 
 # --- Diagnostic Orchestrators ---
-def run_front_diagnostics(components, plate_crop=None):
+def run_front_diagnostics(components, plate_crop=None, movement_tracker=None, image_width=None):
     diagnostics = []
     
-    diagnostics.append(check_mirrors(components.get('mirror', {"count": 0, "confidence": []})))
-    diagnostics.append(check_front_lights(components.get('light_front', {"count": 0, "confidence": []})))
-    diagnostics.append(check_wipers(components.get('wiper', {"count": 0, "confidence": []})))
+    # Paired components - check each side individually using side-specific keys
+    diagnostics.append(check_left_mirror(components.get('left_mirror', {"count": 0, "confidence": []})))
+    diagnostics.append(check_right_mirror(components.get('right_mirror', {"count": 0, "confidence": []})))
+    # Lights get brightness change verification
+    diagnostics.append(check_left_light_front(
+        components.get('left_light_front', {"count": 0, "confidence": []}),
+        movement_tracker=movement_tracker,
+        image_width=image_width))
+    diagnostics.append(check_right_light_front(
+        components.get('right_light_front', {"count": 0, "confidence": []}),
+        movement_tracker=movement_tracker,
+        image_width=image_width))
+    # Wipers get movement verification
+    diagnostics.append(check_left_wiper(
+        components.get('left_wiper', {"count": 0, "confidence": []}),
+        movement_tracker=movement_tracker,
+        image_width=image_width))
+    diagnostics.append(check_right_wiper(
+        components.get('right_wiper', {"count": 0, "confidence": []}),
+        movement_tracker=movement_tracker,
+        image_width=image_width))
+    
+    # Single components - unchanged, using original keys
     diagnostics.append(check_mirror_top(components.get('mirror_top', {"count": 0, "confidence": []})))
-    plate_msg, plate_number = check_plate_number(components.get('plate_number', {"count": 0, "confidence": []}), plate_crop)
+    
+    # Plate number - unchanged
+    plate_msg, plate_number = check_plate_number(
+        components.get('plate_number', {"count": 0, "confidence": []}), 
+        plate_crop)
     diagnostics.append(plate_msg)
     
     return diagnostics, plate_number
 
-def run_back_diagnostics(components, plate_crop=None):
+def run_back_diagnostics(components, plate_crop=None, movement_tracker=None, image_width=None):
     diagnostics = []
     
-    diagnostics.append(check_back_lights(components.get('light_back', {"count": 0, "confidence": []})))
-    diagnostics.append(check_stands(components.get('stand', {"count": 0, "confidence": []})))
+    # Paired components - check each side individually using side-specific keys
+    diagnostics.append(check_left_light_back(components.get('left_light_back', {"count": 0, "confidence": []})))
+    diagnostics.append(check_right_light_back(components.get('right_light_back', {"count": 0, "confidence": []})))
+    diagnostics.append(check_left_stand(components.get('left_stand', {"count": 0, "confidence": []})))
+    diagnostics.append(check_right_stand(components.get('right_stand', {"count": 0, "confidence": []})))
+    
+    # Single components - unchanged, using original keys
     diagnostics.append(check_carrier(components.get('carrier', {"count": 0, "confidence": []})))
     diagnostics.append(check_lift(components.get('lift', {"count": 0, "confidence": []})))
+    
+    # Plate number - unchanged
     plate_msg, plate_number = check_plate_number(components.get('plate_number', {"count": 0, "confidence": []}), plate_crop)
     diagnostics.append(plate_msg)
     
