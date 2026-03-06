@@ -1,4 +1,5 @@
-""" utility.py - Pure utility functions for truck diagnostic system"""
+# utility.py
+"""Pure utility functions for truck diagnostic system"""
 
 import os
 import sys
@@ -16,9 +17,10 @@ from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 # Import configuration constants
 from config import (
     DIAGNOSTICS_PATH, CROPPED_PARTS_PATH, YOLO_MODEL_PATH, VLM_MODEL_PATH,
+    SAVE_DEBUG_CROPS_LIGHT, SAVE_DEBUG_CROPS_WIPER,
     BLUE, RED, ORANGE, GREEN, CYAN, RESET
 )
-
+    
 # Configure module-specific logger
 logger = logging.getLogger(__name__)
 
@@ -557,3 +559,79 @@ def cleanup_saved_crops():
     logger.info("")  # Blank line for readability
     return True
 
+# --- Save debug crop images for light/wiper analysis ---
+def save_debug_crop(
+    crop_image,
+    side,
+    component,
+    track_id,
+    frame_id,
+    sample_count,
+    diagnosis_timestamp,
+    parts_session_folder,
+    crop_type
+):
+    """
+    Save debug crop image for light or wiper analysis review.
+    
+    Args:
+        crop_image: NumPy array of cropped region (BGR format)
+        side: "left" or "right"
+        component: "light_front" or "wiper"
+        track_id: YOLO track ID for the component
+        frame_id: Frame number where crop was captured
+        sample_count: Diagnostic sample number (1-7)
+        diagnosis_timestamp: Session start timestamp in "YYYY-MM-DD HH:MM:SS" format
+        parts_session_folder: Session folder name like "parts_20260206_143522_123"
+        crop_type: "light" or "wiper" to determine subfolder
+    
+    Returns:
+        str: Path to saved debug crop image, or None if saving disabled
+    """
+    # Check if saving is enabled for this crop type
+    if crop_type == "light" and not SAVE_DEBUG_CROPS_LIGHT:
+        return None
+    if crop_type == "wiper" and not SAVE_DEBUG_CROPS_WIPER:
+        return None
+    
+    # Validate crop image
+    if crop_image is None or crop_image.size == 0:
+        logger.warning(f"Invalid {crop_type} crop image for debugging")
+        return None
+    
+    # Extract date/time for folder structure
+    try:
+        dt = datetime.strptime(diagnosis_timestamp, "%Y-%m-%d %H:%M:%S")
+        date_str = dt.strftime("%Y%m%d")
+        time_str = dt.strftime("%H%M%S")
+        monthly_folder = dt.strftime("%Y%m")
+    except:
+        date_str = datetime.now().strftime("%Y%m%d")
+        time_str = datetime.now().strftime("%H%M%S")
+        monthly_folder = datetime.now().strftime("%Y%m")
+    
+    # Build folder path: cropped_parts/YYYYMM/parts_YYYYMMDD_HHMMSS_mmm/{crop_type}_debug_YYYYMMDD_HHMMSS/
+    debug_subfolder = f"{crop_type}_debug_{date_str}_{time_str}"
+    base_output_dir = os.path.join(CROPPED_PARTS_PATH, monthly_folder, parts_session_folder, debug_subfolder)
+    
+    # Create directory
+    os.makedirs(base_output_dir, exist_ok=True)
+    
+    # Filename format: {component}_{int_N}_{id_N}_frame{N}.jpg, Order: Component → Intermediate Group → Tracking ID → Frame Number
+    component_name = f"{side}_{component}"  # e.g., "right_wiper" or "left_light_front"
+    int_group = f"int_{sample_count}"       # e.g., "int_1" through "int_7" (NEVER int_0)
+    track_id_str = f"id{track_id}"          # e.g., "id5", "id15"
+    frame_str = f"frame{frame_id}"          # e.g., "frame127"
+    
+    # Filename structure (replaces old: {side}_{component}_track{track_id}_frame{frame_id}_sample{sample_count}.jpg)
+    filename = f"{component_name}_{int_group}_{track_id_str}_{frame_str}.jpg"
+    filepath = os.path.join(base_output_dir, filename)
+    
+    # Save crop image
+    try:
+        cv2.imwrite(filepath, crop_image)
+        logger.debug(f"Debug {crop_type} crop saved: {filepath}")
+        return filepath
+    except Exception as e:
+        logger.error(f"Failed to save debug {crop_type} crop: {e}")
+        return None
