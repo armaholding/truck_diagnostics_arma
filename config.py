@@ -22,19 +22,22 @@ BORDER = 4       # Quiet zone (modules)
 FONT_SIZE = 40   # Font size for name label
 
 # --- Operational Constants ---
-QRCODE_PREFIX = "arma_driver: "                    # Prefix for QR payload
-INPUT_MODE = "video"                               # Options: "image", "camera", "video"
-YOLO_MODEL_PATH = 'truck7.pt'                      # Path to the YOLO model
+QRCODE_PREFIX = "arma_driver: "                              # Prefix for QR payload
+INPUT_MODE = "video"                                         # Options: "image", "camera", "video"
+YOLO_MODEL_PATH = 'truck9.pt'                                # Path to the YOLO model
 VLM_MODEL_PATH = "NAMAA-Space/Qari-OCR-v0.3-VL-2B-Instruct"  # Path to the VLM OCR model
-MAINENANCE_BOT_MODEL = "gpt-4o-mini"                              # OpenAI model for repair instructions
+MAINENANCE_BOT_MODEL = "gpt-4o-mini"                         # OpenAI model for repair and maintenance instructions
 
 # --- Input & Tracking Configuration ---
-CAMERA_INDEX = 0               # Default camera index for live feed
-CONSENSUS_WINDOW_SECONDS = 18  # Time window for consensus diagnostics
-IGNORE_PERIOD_SECONDS = 2      # Initial ignore period for unstable detections
-SAVE_INTERVAL_SECONDS = 3      # Interval to save intermediate diagnostics
-TRACKER_TYPE = "botsort.yaml"  # or "bytetrack.yaml"
+CAMERA_INDEX = 0                # Default camera index for live feed
+COUNT_TO_DECIDE_CONSENSUS = 7   # Maximum number of diagnostic samples to collect before stopping
+DIAGNOSTIC_INTERVAL_SECONDS = 5 # Real-time interval between diagnostic collections
+IGNORE_PERIOD_SECONDS = 2       # Initial ignore period for unstable detections
+MIN_SAMPLE_GAP_FRAMES = 150     # Minimum frames between samples (ensures crop collection window)
+TRACKER_TYPE = "botsort.yaml"   # or "bytetrack.yaml"
 IOU_THRESHOLD = 0.35
+# CONSENSUS_WINDOW_SECONDS = 18   # Time window for consensus diagnostics
+# SAVE_INTERVAL_SECONDS = 3       # Interval to save intermediate diagnostics
 
 # --- Diagnostic Configuration ---
 DIAGNOSTIC_THRESHOLD = 0.40  # for "ok" vs "ng"
@@ -51,14 +54,51 @@ EXPECTED_COMPONENT_COUNTS = {
     'truck_front': 1,
     'truck_back': 1
 }
-FRONT_EXPECTED_COMPONENTS = {'mirror', 'light_front', 'wiper', 'mirror_top', 'plate_number'}
-BACK_EXPECTED_COMPONENTS = {'carrier', 'lift', 'light_back', 'stand', 'plate_number'}
+PAIRED_COMPONENTS = {
+    "mirror": ("left_mirror", "right_mirror"),
+    "light_front": ("left_light_front", "right_light_front"),
+    "light_back": ("left_light_back", "right_light_back"),
+    "wiper": ("left_wiper", "right_wiper"),
+    "stand": ("left_stand", "right_stand"),
+}
+FRONT_EXPECTED_COMPONENTS = {
+    "left_mirror", "right_mirror",
+    "left_light_front", "right_light_front",
+    "left_wiper", "right_wiper",
+    "mirror_top",
+    "plate_number"
+}
+BACK_EXPECTED_COMPONENTS = {
+    "left_light_back", "right_light_back",
+    "left_stand", "right_stand",
+    "carrier",
+    "lift",
+    "plate_number"
+}
+
+
+# Wiper Configuration
+WIPER_FRAMES_TO_COLLECT = 6                 # Number of frames to collect for wiper analysis
+WIPER_COLLECTION_INTERVAL_SECONDS = 0.5     # Real-time interval between wiper frame collection
+WIPER_MIN_FRAMES_FOR_ANALYSIS = 3           # Minimum frames required to assess wiper movement (fallback to detection-only if less)
+WIPER_MOVEMENT_THRESHOLD_RELATIVE = 0.10    # Movement threshold: 10% of image width for "significant" displacement
+
+# Light Configuration
+LIGHT_FRAMES_TO_COLLECT = 6                 # Number of frames to collect for light analysis
+LIGHT_COLLECTION_INTERVAL_SECONDS = 0.5     # Real-time interval between frame collection (seconds)
+LIGHT_MIN_FRAMES_FOR_ANALYSIS = 3           # Minimum frames required for light analysis (fallback to detection-only if less)
+LIGHT_BRIGHTNESS_CHANGE_THRESHOLD = 15      # Brightness change threshold (standard deviation on 0-255 scale)
+LIGHT_GRID_ROWS = 10                        # Grid resolution for light analysis
+LIGHT_GRID_COLS = 10                        # Grid resolution for light analysis
+LIGHT_MIN_SECTION_GRIDS = 2                 # Minimum total grids for valid working section (Equivalent to 1x2 or 2x1)
 
 # --- Output Configuration ---
 SAVE_INTERMEDIATE_DIAGNOSTICS = True  # Set to True to save diagnostics for each frame in video mode
-SAVE_CROPS = True  # Set to True to save cropped bounding boxes for validation
-DELETE_INT_DIAGNOSTICS = True  # When True, triggers interactive deletion prompt AFTER processing completes
-DELETE_SAVED_CROPS = True  # When True, triggers interactive deletion prompt for cropped parts AFTER processing completes
+SAVE_CROPS = True                     # Set to True to save cropped bounding boxes for validation
+DELETE_INT_DIAGNOSTICS = True         # When True, triggers interactive deletion prompt AFTER processing completes
+DELETE_SAVED_CROPS = True             # When True, triggers interactive deletion prompt for cropped parts AFTER processing completes
+SAVE_DEBUG_CROPS_LIGHT = True        # Save debug crop images for light brightness analysis
+SAVE_DEBUG_CROPS_WIPER = True        # Save debug crop images for wiper movement analysis
 
 # --- OCR Configuration ---
 OCR_LANGUAGES = ['en']  # You can change this to ['ar'] or ['en', 'ar'] etc.
